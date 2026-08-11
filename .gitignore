@@ -1,0 +1,54 @@
+# Python environments and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Local application state and logs
+last_run.log
+*.log
+config.json
+history.json
+
+# Models and GPU runtime are installed locally
+models/
+runtime/
+*.bin
+*.onnx
+*.dll
+
+# Local design/browser state
+.superdesign/
+
+# Temporary validation and reference corpora
+.tmp-*/
+.tmp-*
+validation/*.wav
+validation/*.mp3
+validation/*.mp4
+validation/*.json
+validation/*.srt
+validation/*.txt
+
+# User media and generated transcription artifacts
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.mp3
+*.wav
+*.m4a
+*.aac
+*.flac
+*.webm
+*.source-context.json
+*.llm-corrections.json
+转写结果/
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini

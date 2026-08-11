@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LocalTranscriber</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">LocalTranscriber</div>
+      <nav class="primary-nav" aria-label="主要功能">
+        <button class="nav-item active" id="navUpload" type="button">
+          <i data-lucide="circle-plus" class="lucide-icon icon-19" aria-hidden="true"></i>
+          <span>上传视频</span>
+        </button>
+        <button class="nav-item" id="navContent" type="button">
+          <i data-lucide="history" class="lucide-icon icon-19" aria-hidden="true"></i>
+          <span>内容</span>
+        </button>
+      </nav>
+
+      <section class="recent-section" aria-labelledby="recentTitle">
+        <h2 id="recentTitle">最近记录</h2>
+        <div class="recent-list" id="recentList">
+          <p class="recent-empty">暂无记录</p>
+        </div>
+      </section>
+
+      <div class="sidebar-settings-wrap">
+        <button class="settings-entry" id="settingsButton" type="button">
+          <i data-lucide="settings" class="lucide-icon icon-19" aria-hidden="true"></i>
+          <span>设置</span>
+        </button>
+      </div>
+    </aside>
+
+    <main class="main-workspace">
+      <section class="module-view upload-view" id="uploadView" aria-label="上传视频">
+        <div class="upload-card">
+          <div class="dropzone" id="dropzone">
+            <i data-lucide="upload" class="lucide-icon dropzone-lucide" aria-hidden="true"></i>
+            <p class="dropzone-title">拖拽文件或文件夹至此</p>
+            <p class="dropzone-help">支持 MP4、WAV、MP3 等常用格式</p>
+            <div class="dropzone-actions">
+              <button class="secondary-button" id="selectFilesButton" type="button">选择文件</button>
+              <button class="secondary-button" id="selectFolderButton" type="button">选择文件夹</button>
+            </div>
+          </div>
+
+          <section class="queue-region" aria-labelledby="queueTitle">
+            <header class="queue-header">
+              <div class="queue-title-row">
+                <h2 id="queueTitle">待处理视频</h2>
+                <span class="count-badge" id="fileCount">0 个</span>
+              </div>
+              <div class="queue-actions">
+                <button class="text-button" id="addMoreButton" type="button">继续添加</button>
+                <button class="text-button muted" id="clearButton" type="button" disabled>清空</button>
+              </div>
+            </header>
+            <div class="queue-list" id="queueList">
+              <div class="queue-empty" id="queueEmpty">添加文件后将在这里显示处理列表</div>
+            </div>
+          </section>
+
+          <section class="run-area">
+            <div class="run-progress hidden" id="runProgress">
+              <div class="progress-line">
+                <span id="statusText">准备开始</span>
+                <span id="progressText">0%</span>
+              </div>
+              <div class="progress-track"><span id="progressFill"></span></div>
+            </div>
+            <div class="run-actions">
+              <button class="secondary-button hidden" id="pauseButton" type="button">暂停</button>
+              <button class="danger-text-button hidden" id="cancelButton" type="button">取消</button>
+              <button class="primary-button start-button" id="startButton" type="button" disabled>开始任务</button>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="module-view content-view hidden" id="contentView" aria-label="内容">
+        <section class="history-view" id="historyView">
+          <header class="content-page-header">
+            <h1>内容</h1>
+            <label class="search-box">
+              <i data-lucide="search" class="lucide-icon search-lucide" aria-hidden="true"></i>
+              <input id="historySearch" type="search" placeholder="搜索文件">
+            </label>
+          </header>
+          <div class="history-filters" id="historyFilters">
+            <button class="filter-button active" data-filter="all" type="button">全部</button>
+            <button class="filter-button" data-filter="processing" type="button">处理中</button>
+            <button class="filter-button" data-filter="completed" type="button">已完成</button>
+            <button class="filter-button" data-filter="failed" type="button">失败</button>
+          </div>
+          <div class="history-list" id="historyList">
+            <div class="content-empty">还没有转写记录</div>
+          </div>
+        </section>
+
+        <section class="detail-view hidden" id="detailView">
+          <header class="detail-header">
+            <div class="detail-title-area">
+              <button class="back-button" id="backToHistoryButton" type="button" aria-label="返回内容列表"><i data-lucide="arrow-left" class="lucide-icon icon-19" aria-hidden="true"></i></button>
+              <div class="detail-title-copy">
+                <h1 id="detailTitle">转写内容</h1>
+                <span class="status-pill" id="detailStatus">等待中</span>
+              </div>
+            </div>
+            <div class="detail-actions">
+              <button class="icon-action" id="copyResultButton" type="button" title="复制内容"><i data-lucide="copy" class="lucide-icon icon-17" aria-hidden="true"></i></button>
+              <button class="icon-action" id="openResultButton" type="button" title="打开结果文件夹"><i data-lucide="folder-open" class="lucide-icon icon-17" aria-hidden="true"></i></button>
+            </div>
+          </header>
+
+          <div class="detail-progress hidden" id="detailProgress">
+            <div class="progress-line">
+              <span id="detailProgressStatus">处理中</span>
+              <span id="detailProgressText">0%</span>
+            </div>
+            <div class="progress-track"><span id="detailProgressFill"></span></div>
+          </div>
+
+          <div class="viewer-toolbar">
+            <div class="material-tabs" id="materialTabs">
+              <button class="material-tab active" data-material="accurate" type="button">准确稿.md</button>
+              <button class="material-tab" data-material="raw" type="button">原始转写.md</button>
+              <button class="material-tab" data-material="corrections" type="button">校订记录.md</button>
+            </div>
+            <div class="view-switch" id="viewSwitch">
+              <button class="active" data-mode="preview" type="button">预览</button>
+              <button data-mode="source" type="button">Markdown 源码</button>
+            </div>
+          </div>
+
+          <div class="viewer-body">
+            <article class="markdown-body" id="markdownPreview">
+              <div class="content-empty">完成转写后可在这里查看 Markdown</div>
+            </article>
+            <pre class="markdown-source hidden" id="markdownSource"></pre>
+          </div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <div class="modal-backdrop hidden" id="settingsOverlay" role="presentation">
+    <section class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <header class="settings-header">
+        <h2 id="settingsTitle">设置</h2>
+        <button class="close-button" id="closeSettingsButton" type="button" aria-label="关闭设置"><i data-lucide="x" class="lucide-icon icon-19" aria-hidden="true"></i></button>
+      </header>
+      <div class="settings-body">
+        <div class="settings-grid">
+          <label class="field-group">
+            <span>转写语言</span>
+            <select id="languageSelect">
+              <option value="auto">自动识别（仅转写）</option>
+              <option value="zh">中文（普通话）</option>
+              <option value="en">English</option>
+              <option value="ja">日本語</option>
+              <option value="ko">한국어</option>
+            </select>
+          </label>
+          <label class="field-group">
+            <span>计算设备</span>
+            <select id="deviceSelect">
+              <option value="auto">自动（GPU 优先）</option>
+              <option value="cuda">NVIDIA CUDA</option>
+              <option value="cpu">仅使用 CPU</option>
+            </select>
+          </label>
+        </div>
+
+        <section class="settings-row correction-setting">
+          <div>
+            <strong>智能校订</strong>
+            <small>使用 DeepSeek 修复明显的上下文错误</small>
+          </div>
+          <label class="switch">
+            <input id="llmRepair" type="checkbox">
+            <span></span>
+          </label>
+        </section>
+
+        <section class="deepseek-panel hidden" id="llmKeyPanel">
+          <label class="field-group">
+            <span>DeepSeek API Key</span>
+            <input id="deepseekApiKey" type="password" autocomplete="off" placeholder="sk-...">
+          </label>
+          <p>密钥仅传给本次转写进程，不写入历史记录。</p>
+        </section>
+
+        <section class="destination-section">
+          <h3>默认保存位置</h3>
+          <label class="radio-row">
+            <input type="radio" name="outputMode" value="source" checked>
+            <span>保存在源文件旁</span>
+          </label>
+          <label class="radio-row">
+            <input type="radio" name="outputMode" value="custom">
+            <span>自定义文件夹</span>
+          </label>
+          <div class="path-control hidden" id="pathControl">
+            <input id="outputPath" type="text" readonly placeholder="请选择保存文件夹">
+            <button class="secondary-button compact" id="chooseOutputButton" type="button">选择文件夹</button>
+          </div>
+        </section>
+
+        <details class="diagnostics">
+          <summary>诊断日志</summary>
+          <div class="diagnostic-meta"><span id="modelStatus">模型待加载</span><span id="logHint">暂无日志</span></div>
+          <pre id="logOutput">等待开始转写…</pre>
+        </details>
+      </div>
+      <footer class="settings-footer">
+        <button class="primary-button compact-primary" id="saveSettingsButton" type="button">保存设置</button>
+      </footer>
+    </section>
+  </div>
+
+  <input id="modelSelect" type="hidden" value="medium">
+  <input id="contextMode" type="hidden" value="isolated">
+  <input id="skipExisting" type="checkbox" checked hidden>
+  <input id="autoStartFolder" type="checkbox" hidden>
+  <textarea id="promptInput" hidden></textarea>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+  <script src="vendor/lucide.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
