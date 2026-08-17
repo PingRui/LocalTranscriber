@@ -1,553 +1,423 @@
 (() => {
-  const SETTINGS_KEY = "localtranscriber.settings.v2";
-  const PROCESSING_STATUSES = new Set(["等待中", "模型加载中", "转写中", "已暂停", "大模型校订中"]);
-  const COMPLETED_STATUSES = new Set(["已完成", "校订完成", "已有结果"]);
+  "use strict";
 
-  const state = {
-    files: [],
-    history: [],
-    running: false,
-    paused: false,
-    scanning: false,
-    statusText: "请添加需要转写的文件",
-    progress: 0,
-    logs: [],
-    resultDirs: {},
-    outputPath: "",
-    sourceUrls: {},
-    historyFilter: "all",
-    historyQuery: "",
-    currentSource: "",
-    currentMaterial: "accurate",
-    currentViewMode: "preview",
-    currentContent: "",
-  };
+  const $ = (id) => document.getElementById(id);
+  const escapeHtml = (value) => String(value ?? "")
+    .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;").replaceAll("'", "&#039;");
+  const basename = (path) => String(path || "").split(/[\\/]/).filter(Boolean).pop() || path || "";
+  const state = { snapshot: null, activeView: "generation", busy: new Set(), playerCitation: null };
+  let toastSignature = "";
+  let toastTime = 0;
+  let uiBound = false;
+  let bootPromise = null;
 
-  const elements = {};
-  const byId = (id) => document.getElementById(id);
-
-  function cacheElements() {
-    [
-      "navUpload", "navContent", "recentList", "settingsButton", "uploadView", "contentView",
-      "dropzone", "selectFilesButton", "selectFolderButton", "queueList", "queueEmpty", "fileCount",
-      "addMoreButton", "clearButton", "runProgress", "statusText", "progressText", "progressFill",
-      "pauseButton", "cancelButton", "startButton", "historyView", "detailView", "historySearch",
-      "historyFilters", "historyList", "backToHistoryButton", "detailTitle", "detailStatus",
-      "detailProgress", "detailProgressStatus", "detailProgressText", "detailProgressFill", "materialTabs",
-      "viewSwitch", "markdownPreview", "markdownSource", "copyResultButton", "openResultButton",
-      "settingsOverlay", "closeSettingsButton", "saveSettingsButton", "languageSelect", "deviceSelect",
-      "llmRepair", "llmKeyPanel", "deepseekApiKey", "pathControl", "outputPath", "chooseOutputButton",
-      "modelStatus", "logHint", "logOutput", "modelSelect", "contextMode", "skipExisting",
-      "autoStartFolder", "promptInput", "toastRegion",
-    ].forEach((id) => { elements[id] = byId(id); });
+  function currentDesktopApi() {
+    const api = window.pywebview?.api;
+    return api && typeof api === "object" ? api : null;
   }
 
-  function escapeHtml(value) {
-    return String(value ?? "")
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;")
-      .replaceAll("'", "&#039;");
-  }
-
-  function statusClass(status) {
-    if (COMPLETED_STATUSES.has(status)) return "success";
-    if (PROCESSING_STATUSES.has(status)) return "processing";
-    if (status === "失败") return "error";
-    if (["已取消"].includes(status)) return "warning";
-    return "";
-  }
-
-  function refreshIcons() {
-    if (window.lucide?.createIcons) {
-      window.lucide.createIcons({ attrs: { "stroke-width": 2 } });
-    }
-  }
-
-  function formatDate(value) {
-    if (!value) return "";
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return String(value);
-    return new Intl.DateTimeFormat("zh-CN", {
-      month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
-    }).format(date);
-  }
-
-  function currentHistoryItem() {
-    return state.history.find((item) => item.path === state.currentSource)
-      || state.files.find((item) => item.path === state.currentSource)
-      || null;
-  }
-
-  function renderQueue() {
-    const locked = state.running || state.scanning;
-    const known = new Set(state.files.map((file) => file.path));
-    Object.keys(state.sourceUrls).forEach((path) => {
-      if (!known.has(path)) delete state.sourceUrls[path];
+  async function waitForDesktopApi(timeoutMs = 5000) {
+    const ready = currentDesktopApi();
+    if (ready) return ready;
+    const startedAt = Date.now();
+    return new Promise((resolve, reject) => {
+      let timer = 0;
+      const finish = (api) => {
+        window.clearInterval(timer);
+        window.removeEventListener("pywebviewready", check);
+        if (api) resolve(api);
+        else reject(new Error("桌面服务尚未就绪，请关闭当前预览页，并从桌面快捷方式重新打开软件。"));
+      };
+      const check = () => {
+        const api = currentDesktopApi();
+        if (api) finish(api);
+        else if (Date.now() - startedAt >= timeoutMs) finish(null);
+      };
+      window.addEventListener("pywebviewready", check);
+      timer = window.setInterval(check, 100);
+      check();
     });
-
-    elements.fileCount.textContent = `${state.files.length} 个`;
-    elements.queueEmpty.classList.toggle("hidden", state.files.length > 0);
-    elements.clearButton.disabled = locked || state.files.length === 0;
-    elements.addMoreButton.disabled = locked;
-
-    const rows = state.files.map((file) => {
-      const progress = Math.max(0, Math.min(100, Number(file.progress || 0)));
-      const url = state.sourceUrls[file.path] || file.source_url || "";
-      const isAudio = [".wav", ".mp3", ".m4a", ".aac", ".flac"].some((suffix) => file.name.toLowerCase().endsWith(suffix));
-      const progressBar = PROCESSING_STATUSES.has(file.status)
-        ? `<div class="mini-progress"><span style="width:${Math.max(2, progress)}%"></span></div>`
-        : "";
-      const inlineSource = url ? "" : `
-        <details class="inline-source-details">
-          <summary><i data-lucide="link" class="lucide-icon source-link-icon" aria-hidden="true"></i><span>补充来源（可选）</span></summary>
-          <div class="inline-source-popover">
-            <input data-action="source-url" type="url" value="" placeholder="粘贴 YouTube、Bilibili、抖音等视频页面地址" ${locked ? "disabled" : ""}>
-          </div>
-        </details>`;
-      const expandedSource = url ? `
-        <details class="source-details" open>
-          <summary><i data-lucide="chevron-right" class="lucide-icon source-chevron" aria-hidden="true"></i><span>补充视频来源（可选）</span></summary>
-          <div class="source-control">
-            <i data-lucide="link" class="lucide-icon source-link-icon" aria-hidden="true"></i>
-            <input data-action="source-url" type="url" value="${escapeHtml(url)}" placeholder="粘贴 YouTube、Bilibili、抖音等视频页面地址" ${locked ? "disabled" : ""}>
-          </div>
-        </details>` : "";
-      return `
-        <article class="queue-item ${PROCESSING_STATUSES.has(file.status) ? "running" : ""} ${url ? "has-source" : ""}" data-path="${escapeHtml(file.path)}">
-          <div class="queue-item-main">
-            <i data-lucide="${isAudio ? "mic" : "video"}" class="lucide-icon file-type-icon" aria-hidden="true"></i>
-            <div class="file-copy">
-              <div class="file-name" title="${escapeHtml(file.path)}">${escapeHtml(file.name)}</div>
-              <div class="file-meta">${escapeHtml(file.size_label || file.folder || "")}</div>
-            </div>
-            ${progressBar}
-            ${inlineSource}
-            <span class="status-pill ${statusClass(file.status)}">${escapeHtml(file.status || "等待中")}</span>
-            <button class="remove-file-button" data-action="remove" type="button" aria-label="移除 ${escapeHtml(file.name)}" ${locked ? "disabled" : ""}><i data-lucide="trash-2" class="lucide-icon icon-16" aria-hidden="true"></i></button>
-          </div>
-          ${expandedSource}
-        </article>`;
-    }).join("");
-
-    elements.queueList.querySelectorAll(".queue-item").forEach((item) => item.remove());
-    if (rows) elements.queueList.insertAdjacentHTML("beforeend", rows);
-    refreshIcons();
-    renderRunControls();
   }
 
-  function renderRunControls() {
-    const locked = state.running || state.scanning;
-    const hasFiles = state.files.length > 0;
-    const showProgress = locked || state.progress > 0;
-    const progress = Math.max(0, Math.min(100, Number(state.progress || 0)));
-
-    elements.selectFilesButton.disabled = locked;
-    elements.selectFolderButton.disabled = locked;
-    elements.startButton.disabled = locked || !hasFiles;
-    elements.startButton.classList.toggle("hidden", state.running || state.scanning);
-    elements.startButton.textContent = hasFiles ? `开始任务（${state.files.length}）` : "开始任务";
-    elements.pauseButton.classList.toggle("hidden", !state.running);
-    elements.cancelButton.classList.toggle("hidden", !state.running);
-    elements.pauseButton.textContent = state.paused ? "继续" : "暂停";
-    elements.runProgress.classList.toggle("hidden", !showProgress);
-    elements.statusText.textContent = state.statusText;
-    elements.progressText.textContent = state.scanning ? "扫描中" : state.paused ? "已暂停" : `${Math.round(progress)}%`;
-    elements.progressFill.style.width = `${progress}%`;
-  }
-
-  function historyMatchesFilter(item) {
-    if (state.historyFilter === "processing") return PROCESSING_STATUSES.has(item.status);
-    if (state.historyFilter === "completed") return COMPLETED_STATUSES.has(item.status);
-    if (state.historyFilter === "failed") return item.status === "失败";
-    return true;
-  }
-
-  function renderHistory() {
-    const query = state.historyQuery.trim().toLowerCase();
-    const items = state.history.filter((item) => {
-      const matchesSearch = !query || `${item.name} ${item.path}`.toLowerCase().includes(query);
-      return matchesSearch && historyMatchesFilter(item);
-    });
-
-    elements.historyList.innerHTML = items.length ? items.map((item) => {
-      const progress = Math.max(0, Math.min(100, Number(item.progress || 0)));
-      const isAudio = String(item.media_type || "").toLowerCase() === "audio";
-      const progressBlock = PROCESSING_STATUSES.has(item.status)
-        ? `<div class="history-progress"><span class="status-pill ${statusClass(item.status)}">${escapeHtml(item.status)}</span><div class="mini-progress"><span style="width:${Math.max(2, progress)}%"></span></div></div>`
-        : `<div class="history-progress"><span class="status-pill ${statusClass(item.status)}">${escapeHtml(item.status || "等待中")}</span></div>`;
-      return `
-        <button class="history-item" data-source="${escapeHtml(item.path)}" type="button">
-          <span class="history-main">
-            <i data-lucide="${isAudio ? "mic" : "video"}" class="lucide-icon file-type-icon" aria-hidden="true"></i>
-            <span class="history-copy">
-              <span class="history-name">${escapeHtml(item.name)}</span>
-              <span class="history-meta">${escapeHtml(item.size_label || item.folder || "")}</span>
-            </span>
-          </span>
-          ${progressBlock}
-          <span class="history-date">${escapeHtml(formatDate(item.updated_at || item.created_at))}</span>
-          <span class="history-arrow">›</span>
-        </button>`;
-    }).join("") : '<div class="content-empty">没有符合条件的记录</div>';
-
-    elements.recentList.innerHTML = state.history.length ? state.history.slice(0, 8).map((item) => `
-      <button class="recent-item" data-source="${escapeHtml(item.path)}" type="button">
-        <i data-lucide="${item.media_type === "audio" ? "mic" : "video"}" class="lucide-icon recent-media-icon" aria-hidden="true"></i>
-        <span>${escapeHtml(item.name)}</span>
-      </button>`).join("") : '<p class="recent-empty">暂无记录</p>';
-    refreshIcons();
-  }
-
-  function renderDetail() {
-    const item = currentHistoryItem();
-    if (!item) return;
-    const progress = Math.max(0, Math.min(100, Number(item.progress || 0)));
-    elements.detailTitle.textContent = item.name;
-    elements.detailStatus.textContent = item.status || "等待中";
-    elements.detailStatus.className = `status-pill ${statusClass(item.status)}`;
-    const processing = PROCESSING_STATUSES.has(item.status);
-    elements.detailProgress.classList.toggle("hidden", !processing);
-    elements.detailProgressStatus.textContent = item.status || state.statusText;
-    elements.detailProgressText.textContent = `${Math.round(progress)}%`;
-    elements.detailProgressFill.style.width = `${progress}%`;
-  }
-
-  function renderLogs() {
-    if (!state.logs.length) {
-      elements.logOutput.textContent = "等待开始转写…";
-      elements.logHint.textContent = "暂无日志";
-    } else {
-      elements.logOutput.textContent = state.logs.join("\n");
-      elements.logHint.textContent = `最近 ${state.logs.length} 条`;
-      elements.logOutput.scrollTop = elements.logOutput.scrollHeight;
-    }
-    elements.modelStatus.textContent = state.modelStatus || "模型待加载";
-  }
-
-  function applySnapshot(snapshot) {
-    if (!snapshot) return;
-    state.files = snapshot.files || [];
-    state.history = snapshot.history || state.history;
-    state.running = Boolean(snapshot.running);
-    state.paused = Boolean(snapshot.paused);
-    state.scanning = Boolean(snapshot.scanning);
-    state.statusText = snapshot.status_text || state.statusText;
-    state.progress = Number(snapshot.progress || 0);
-    state.logs = snapshot.logs || [];
-    state.resultDirs = snapshot.result_dirs || {};
-    state.modelStatus = snapshot.model_status || "模型待加载";
-    if (snapshot.default_model) elements.modelSelect.value = snapshot.default_model;
-    if (snapshot.default_device && !localStorage.getItem(SETTINGS_KEY)) {
-      elements.deviceSelect.value = snapshot.default_device;
-    }
-    if (typeof snapshot.output_path === "string" && snapshot.output_path) {
-      state.outputPath = snapshot.output_path;
-      elements.outputPath.value = snapshot.output_path;
-    }
-    state.files.forEach((file) => {
-      if (!(file.path in state.sourceUrls) && file.source_url) state.sourceUrls[file.path] = file.source_url;
-    });
-    renderQueue();
-    renderHistory();
-    renderDetail();
-    renderLogs();
-  }
-
-  function showToast(message, type = "info") {
-    if (!message) return;
-    const toast = document.createElement("div");
-    toast.className = `toast ${type}`;
-    toast.textContent = message;
-    elements.toastRegion.appendChild(toast);
-    window.setTimeout(() => toast.remove(), type === "error" ? 6000 : 3600);
-  }
-
-  function selectedOutputMode() {
-    return document.querySelector('input[name="outputMode"]:checked')?.value || "source";
-  }
-
-  function getSettings() {
-    const sourceUrls = {};
-    Object.entries(state.sourceUrls).forEach(([path, url]) => {
-      const normalized = String(url || "").trim();
-      if (normalized) sourceUrls[path] = normalized;
-    });
-    return {
-      model: elements.modelSelect.value,
-      language: elements.languageSelect.value,
-      device: elements.deviceSelect.value,
-      output_mode: selectedOutputMode(),
-      output_path: elements.outputPath.value.trim(),
-      skip_existing: elements.skipExisting.checked,
-      auto_start_folder: false,
-      prompt: elements.promptInput.value.trim(),
-      source_urls: sourceUrls,
-      context_mode: elements.contextMode.value,
-      llm_repair: elements.llmRepair.checked,
-      deepseek_api_key: elements.deepseekApiKey.value.trim(),
-    };
-  }
-
-  function saveLocalSettings() {
-    const safeSettings = {
-      language: elements.languageSelect.value,
-      device: elements.deviceSelect.value,
-      output_mode: selectedOutputMode(),
-      output_path: elements.outputPath.value.trim(),
-      llm_repair: elements.llmRepair.checked,
-    };
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(safeSettings));
-  }
-
-  function loadLocalSettings() {
-    try {
-      const saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
-      if (saved.language) elements.languageSelect.value = saved.language;
-      if (saved.device) elements.deviceSelect.value = saved.device;
-      elements.llmRepair.checked = Boolean(saved.llm_repair);
-      elements.llmKeyPanel.classList.toggle("hidden", !elements.llmRepair.checked);
-      if (saved.output_path) elements.outputPath.value = saved.output_path;
-      const outputRadio = document.querySelector(`input[name="outputMode"][value="${saved.output_mode || "source"}"]`);
-      if (outputRadio) outputRadio.checked = true;
-      elements.pathControl.classList.toggle("hidden", selectedOutputMode() !== "custom");
-    } catch (_error) {
-      localStorage.removeItem(SETTINGS_KEY);
-    }
+  function icons() {
+    if (window.lucide) window.lucide.createIcons({ attrs: { "stroke-width": 1.8 } });
   }
 
   async function callApi(method, ...args) {
-    try {
-      const response = await window.pywebview.api[method](...args);
-      if (response?.snapshot) applySnapshot(response.snapshot);
-      if (response?.error) showToast(response.error, "error");
-      if (response?.message) showToast(response.message, response.ok === false ? "error" : "info");
-      return response;
-    } catch (error) {
-      showToast(`操作失败：${error}`, "error");
-      return null;
+    const api = await waitForDesktopApi();
+    if (typeof api[method] !== "function") throw new Error(`桌面服务缺少 ${method} 功能，请重新打开软件。`);
+    const result = await api[method](...args);
+    if (result?.snapshot) applySnapshot(result.snapshot);
+    if (result?.message) toast(result.message, "success");
+    if (result?.ok === false) throw new Error(result.error || "操作失败");
+    return result;
+  }
+
+  async function action(key, fn) {
+    if (state.busy.has(key)) return;
+    state.busy.add(key);
+    renderBusy();
+    try { return await fn(); }
+    catch (error) { toast(error?.message || String(error), "error"); }
+    finally { state.busy.delete(key); renderBusy(); }
+  }
+
+  function toast(message, type = "info") {
+    if (!message) return;
+    const signature = `${type}:${message}`;
+    const now = Date.now();
+    if (signature === toastSignature && now - toastTime < 1800) return;
+    toastSignature = signature;
+    toastTime = now;
+    const item = document.createElement("div");
+    item.className = `toast ${type}`;
+    item.textContent = message;
+    $("toastStack").appendChild(item);
+    window.setTimeout(() => item.remove(), 3800);
+  }
+
+  function applySnapshot(snapshot) {
+    state.snapshot = snapshot;
+    renderAll();
+  }
+
+  function renderAll() {
+    if (!state.snapshot) return;
+    renderSpace();
+    renderQueue();
+    renderTask();
+    renderSettings();
+    renderChat();
+    renderBusy();
+    icons();
+  }
+
+  function renderSpace() {
+    const { space, recent_spaces: recent = [], ai } = state.snapshot;
+    $("spaceName").textContent = space.ready ? space.name : "选择知识空间";
+    $("chatSpaceName").textContent = space.ready ? space.name : "尚未选择知识空间";
+    $("knowledgeCountHint").textContent = `${space.knowledge_count || 0} 个知识点`;
+    $("settingsStatusDot").classList.toggle("ready", Boolean(ai.verified));
+    $("recentSpaces").innerHTML = recent.length ? recent.map((path) => `
+      <div class="recent-item">
+        <button class="recent-open" data-space-path="${escapeHtml(path)}">
+          <strong>${escapeHtml(basename(path))}</strong><span>${escapeHtml(path)}</span>
+        </button>
+        <button class="recent-remove" data-remove-space="${escapeHtml(path)}" title="从最近列表移除，不删除磁盘文件" aria-label="移除 ${escapeHtml(basename(path))}">
+          <i data-lucide="x"></i>
+        </button>
+      </div>`).join("") : `<div class="activity-empty">还没有使用过的目录</div>`;
+    document.querySelectorAll("[data-space-path]").forEach((button) => {
+      button.addEventListener("click", () => action("space", () => callApi("open_space", button.dataset.spacePath)));
+    });
+    document.querySelectorAll("[data-remove-space]").forEach((button) => {
+      button.addEventListener("click", () => action("space", () => callApi("remove_recent_space", button.dataset.removeSpace)));
+    });
+  }
+
+  function renderQueue() {
+    const { queue, task, running, ai, space } = state.snapshot;
+    const showTask = Boolean(task);
+    $("taskPanel").classList.toggle("hidden", !showTask);
+    $("queuePanel").classList.toggle("hidden", showTask || !queue.length);
+    $("emptyGeneration").classList.toggle("hidden", showTask || Boolean(queue.length));
+    $("queueSummary").textContent = `${queue.length} 个视频，开始前可以继续添加或移除`;
+    $("queueList").innerHTML = queue.map((item) => `
+      <div class="queue-item">
+        <span class="file-icon"><i data-lucide="file-video-2"></i></span>
+        <span class="queue-copy"><strong>${escapeHtml(item.name)}</strong><span>${escapeHtml(item.source)}</span></span>
+        <span class="queue-size">${escapeHtml(item.size || "")}</span>
+        <button class="remove-queue" data-remove-source="${escapeHtml(item.source)}" title="移除"><i data-lucide="x"></i></button>
+      </div>`).join("");
+    document.querySelectorAll("[data-remove-source]").forEach((button) => {
+      button.addEventListener("click", () => action("queue", () => callApi("remove_video", button.dataset.removeSource)));
+    });
+    const ready = Boolean(ai.verified);
+    $("readinessCard").classList.toggle("ready", ready);
+    $("readinessTitle").textContent = ready ? `AI 服务已验证 · ${ai.model}` : "AI 服务尚未配置";
+    $("readinessText").textContent = ready ? "可进行专业词汇判断、可信校对和知识回答。" : "完成连接测试后才能开始。";
+    $("openSettingsInline").classList.toggle("hidden", ready);
+    $("startTaskButton").disabled = running || !queue.length || !ready || !space.ready;
+  }
+
+  function renderTask() {
+    const { task, running, paused, activities = [] } = state.snapshot;
+    if (!task) return;
+    $("currentVideoName").textContent = task.current_video || "准备任务";
+    $("taskStatusText").textContent = task.status_text || "";
+    const videos = Array.isArray(task.videos) ? task.videos : [];
+    const completedVideos = videos.filter((item) => item.status === "completed").length;
+    const waitingVideos = videos.filter((item) => ["waiting", "interrupted"].includes(item.status)).length;
+    $("taskQueueSummary").textContent = `本任务共 ${videos.length} 个视频 · 已完成 ${completedVideos} · 待处理 ${waitingVideos}`;
+    const progress = Math.max(0, Math.min(100, Number(task.overall_progress || 0)));
+    $("overallProgress").textContent = `${Math.round(progress)}%`;
+    $("overallProgressBar").style.width = `${progress}%`;
+    const statusLabels = {
+      running: "正在处理",
+      completed: "处理完成",
+      failed: "处理失败",
+      interrupted: "等待继续",
+      needs_attention: "等待确认",
+      cancelled: "任务已取消",
+    };
+    $("taskStatusLabel").textContent = paused ? "任务已暂停" : (statusLabels[task.status] || task.status || "准备任务");
+    $("taskStages").innerHTML = (task.stages || []).map((stage) => {
+      const icon = ["completed", "skipped"].includes(stage.status) ? "check" : stage.status === "failed" ? "x" : stage.status === "running" ? "loader-circle" : stage.status === "needs_confirmation" ? "circle-help" : "circle";
+      return `<div class="stage-row ${escapeHtml(stage.status)}">
+        <span class="stage-dot"><i data-lucide="${icon}"></i></span>
+        <span class="stage-copy"><strong>${escapeHtml(stage.label)}</strong><span>${escapeHtml(stage.message || stageStatusText(stage.status))}</span></span>
+        <span class="stage-percent">${stage.progress ? `${Math.round(stage.progress)}%` : ""}</span>
+      </div>`;
+    }).join("");
+    $("activityList").innerHTML = activities.length ? activities.slice().reverse().map((item) => `
+      <div class="activity-item ${escapeHtml(item.level)}"><time>${escapeHtml(item.time)}</time><span>${escapeHtml(item.text)}</span></div>`).join("") : `<div class="activity-empty">状态会在这里实时显示</div>`;
+
+    const needsHotwords = task.current_stage === "confirm" && task.hotword_profile;
+    $("hotwordConfirmCard").classList.toggle("hidden", !needsHotwords);
+    if (needsHotwords) {
+      const input = $("hotwordInput");
+      const words = (task.hotword_profile.hotwords || []).join("，");
+      if (input.dataset.profile !== words) { input.value = words; input.dataset.profile = words; }
+      const category = task.hotword_profile.category || "未分类";
+      const categoryInput = $("hotwordCategory");
+      if (categoryInput.dataset.profile !== category) { categoryInput.value = category; categoryInput.dataset.profile = category; }
+      $("hotwordReason").textContent = (task.hotword_profile.manual_reasons || []).join("；") || "自动判断条件不足，请确认后继续。";
     }
+    const done = task.status === "completed";
+    const resumable = ["failed", "interrupted", "cancelled"].includes(task.status);
+    $("runningActions").classList.toggle("hidden", !running);
+    $("failedActions").classList.toggle("hidden", !resumable);
+    $("completedActions").classList.toggle("hidden", !done);
+    $("pauseButton").classList.toggle("hidden", paused);
+    $("resumeButton").classList.toggle("hidden", !paused);
+    $("appendVideosButton").classList.toggle("hidden", !paused);
+    $("appendFolderButton").classList.toggle("hidden", !paused);
   }
 
-  function showUpload() {
-    elements.uploadView.classList.remove("hidden");
-    elements.contentView.classList.add("hidden");
-    elements.navUpload.classList.add("active");
-    elements.navContent.classList.remove("active");
+  function stageStatusText(status) {
+    return ({ waiting: "等待执行", running: "正在执行", completed: "已完成", skipped: "已从断点复用", failed: "需要处理", needs_confirmation: "等待你的确认" })[status] || "";
   }
 
-  function showHistory() {
-    elements.uploadView.classList.add("hidden");
-    elements.contentView.classList.remove("hidden");
-    elements.historyView.classList.remove("hidden");
-    elements.detailView.classList.add("hidden");
-    elements.navUpload.classList.remove("active");
-    elements.navContent.classList.add("active");
-    renderHistory();
-  }
-
-  async function showDetail(source, load = true) {
-    state.currentSource = source;
-    elements.uploadView.classList.add("hidden");
-    elements.contentView.classList.remove("hidden");
-    elements.historyView.classList.add("hidden");
-    elements.detailView.classList.remove("hidden");
-    elements.navUpload.classList.remove("active");
-    elements.navContent.classList.add("active");
-    renderDetail();
-    if (load) await loadResult();
-  }
-
-  function inlineMarkdown(value) {
-    return escapeHtml(value)
-      .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
-      .replace(/`(.+?)`/g, "<code>$1</code>");
-  }
-
-  function markdownToHtml(markdown) {
-    if (!markdown.trim()) return '<div class="content-empty">暂时没有可显示的内容</div>';
-    const lines = markdown.replace(/^\uFEFF/, "").split(/\r?\n/);
-    const result = [];
-    let listOpen = false;
-    let frontmatter = lines[0]?.trim() === "---";
-    lines.forEach((line, index) => {
-      if (frontmatter) {
-        if (index > 0 && line.trim() === "---") frontmatter = false;
-        return;
-      }
-      const heading = line.match(/^(#{1,3})\s+(.+)$/);
-      const list = line.match(/^[-*]\s+(.+)$/);
-      if (!list && listOpen) { result.push("</ul>"); listOpen = false; }
-      if (heading) {
-        const level = heading[1].length;
-        result.push(`<h${level}>${inlineMarkdown(heading[2])}</h${level}>`);
-      } else if (list) {
-        if (!listOpen) { result.push("<ul>"); listOpen = true; }
-        result.push(`<li>${inlineMarkdown(list[1])}</li>`);
-      } else if (line.trim()) {
-        result.push(`<p>${inlineMarkdown(line)}</p>`);
-      }
-    });
-    if (listOpen) result.push("</ul>");
-    return result.join("");
-  }
-
-  function renderResultContent() {
-    elements.markdownSource.textContent = state.currentContent;
-    elements.markdownPreview.innerHTML = markdownToHtml(state.currentContent);
-    const preview = state.currentViewMode === "preview";
-    elements.markdownPreview.classList.toggle("hidden", !preview);
-    elements.markdownSource.classList.toggle("hidden", preview);
-  }
-
-  async function loadResult() {
-    if (!state.currentSource) return;
-    state.currentContent = "";
-    elements.markdownPreview.innerHTML = '<div class="content-empty">正在读取内容…</div>';
-    elements.markdownSource.textContent = "";
-    const response = await callApi("read_result", state.currentSource, getSettings(), state.currentMaterial);
-    if (response?.ok && typeof response.content === "string") {
-      state.currentContent = response.content;
-      renderResultContent();
-    } else if (response?.pending) {
-      elements.markdownPreview.innerHTML = '<div class="content-empty">转写完成后即可查看内容</div>';
-    } else if (response?.unavailable) {
-      elements.markdownPreview.innerHTML = `<div class="content-empty">${escapeHtml(response.reason || "本次任务没有生成该内容")}</div>`;
-    } else if (response?.ok === false) {
-      elements.markdownPreview.innerHTML = '<div class="content-empty">该任务还没有生成对应内容</div>';
+  function renderSettings() {
+    const { ai, runtime } = state.snapshot;
+    if (document.activeElement !== $("aiBaseUrl")) $("aiBaseUrl").value = ai.base_url || "";
+    if (document.activeElement !== $("aiModel")) $("aiModel").value = ai.model || "";
+    if (document.activeElement !== $("aiContextWindow")) $("aiContextWindow").value = ai.context_window || 128000;
+    const badge = $("aiVerifiedBadge");
+    badge.textContent = ai.verified ? "已验证" : "未验证";
+    badge.classList.toggle("ready", Boolean(ai.verified));
+    const modelSelect = $("runtimeModel");
+    const modelOptions = Array.isArray(runtime.model_options) && runtime.model_options.length
+      ? runtime.model_options
+      : [{ value: "medium", label: "Medium" }, { value: "large-v3-turbo", label: "Large-v3 Turbo" }];
+    const optionSignature = modelOptions.map((item) => `${item.value}:${item.label}`).join("|");
+    if (modelSelect.dataset.options !== optionSignature) {
+      modelSelect.innerHTML = modelOptions.map((item) => `<option value="${escapeHtml(item.value)}">${escapeHtml(item.label)}</option>`).join("");
+      modelSelect.dataset.options = optionSignature;
     }
+    const requestedModel = String(runtime.model || "");
+    modelSelect.value = modelOptions.some((item) => item.value === requestedModel) ? requestedModel : modelOptions[0].value;
+    $("runtimeDevice").value = runtime.device;
+    $("runtimeLanguage").value = runtime.language;
+    $("tempPolicy").value = "manual";
   }
 
-  async function chooseFiles() { await callApi("choose_files"); }
-  async function chooseFolder() { await callApi("choose_folder", false, getSettings()); }
-
-  function bindEvents() {
-    elements.navUpload.addEventListener("click", showUpload);
-    elements.navContent.addEventListener("click", showHistory);
-    elements.selectFilesButton.addEventListener("click", chooseFiles);
-    elements.addMoreButton.addEventListener("click", chooseFiles);
-    elements.selectFolderButton.addEventListener("click", chooseFolder);
-    elements.clearButton.addEventListener("click", () => callApi("clear_files"));
-
-    elements.dropzone.addEventListener("dragover", (event) => {
-      event.preventDefault();
-      elements.dropzone.classList.add("dragging");
+  function renderChat() {
+    const { chat, space } = state.snapshot;
+    const messages = chat.messages || [];
+    $("chatEmpty").classList.toggle("hidden", Boolean(messages.length));
+    $("messageList").innerHTML = messages.map(renderMessage).join("") + (chat.running ? renderLoadingMessage() : "");
+    $("sendKnowledgeButton").disabled = chat.running || !space.ready || !(space.knowledge_count > 0);
+    document.querySelectorAll("[data-citation-index]").forEach((button) => {
+      button.addEventListener("click", () => playCitation(Number(button.dataset.messageIndex), Number(button.dataset.citationIndex)));
     });
-    elements.dropzone.addEventListener("dragleave", () => elements.dropzone.classList.remove("dragging"));
-    elements.dropzone.addEventListener("drop", async (event) => {
-      event.preventDefault();
-      elements.dropzone.classList.remove("dragging");
-      const paths = Array.from(event.dataTransfer?.files || []).map((file) => file.path).filter(Boolean);
-      if (paths.length) await callApi("add_files", paths);
-      else showToast("请使用“选择文件”或“选择文件夹”添加本地媒体");
+    document.querySelectorAll("[data-relink-video]").forEach((button) => {
+      button.addEventListener("click", (event) => {
+        event.stopPropagation();
+        action("relink", () => callApi("relink_missing_video", button.dataset.relinkVideo));
+      });
     });
-
-    elements.queueList.addEventListener("click", async (event) => {
-      const button = event.target.closest('[data-action="remove"]');
-      if (!button) return;
-      const row = button.closest("[data-path]");
-      if (row) await callApi("remove_files", [row.dataset.path]);
-    });
-    elements.queueList.addEventListener("input", (event) => {
-      if (event.target.dataset.action !== "source-url") return;
-      const row = event.target.closest("[data-path]");
-      if (row) state.sourceUrls[row.dataset.path] = event.target.value;
-    });
-
-    elements.startButton.addEventListener("click", async () => {
-      const firstSource = state.files[0]?.path || "";
-      const response = await callApi("start_transcription", getSettings());
-      if (response?.ok && firstSource) {
-        elements.deepseekApiKey.value = "";
-        await showDetail(firstSource, false);
-      }
-    });
-    elements.pauseButton.addEventListener("click", () => callApi(state.paused ? "resume_transcription" : "pause_transcription"));
-    elements.cancelButton.addEventListener("click", () => callApi("cancel_transcription"));
-
-    elements.historySearch.addEventListener("input", () => {
-      state.historyQuery = elements.historySearch.value;
-      renderHistory();
-    });
-    elements.historyFilters.addEventListener("click", (event) => {
-      const button = event.target.closest("[data-filter]");
-      if (!button) return;
-      state.historyFilter = button.dataset.filter;
-      elements.historyFilters.querySelectorAll("[data-filter]").forEach((item) => item.classList.toggle("active", item === button));
-      renderHistory();
-    });
-    elements.historyList.addEventListener("click", (event) => {
-      const item = event.target.closest("[data-source]");
-      if (item) showDetail(item.dataset.source);
-    });
-    elements.recentList.addEventListener("click", (event) => {
-      const item = event.target.closest("[data-source]");
-      if (item) showDetail(item.dataset.source);
-    });
-    elements.backToHistoryButton.addEventListener("click", showHistory);
-
-    elements.materialTabs.addEventListener("click", (event) => {
-      const tab = event.target.closest("[data-material]");
-      if (!tab) return;
-      state.currentMaterial = tab.dataset.material;
-      elements.materialTabs.querySelectorAll("[data-material]").forEach((item) => item.classList.toggle("active", item === tab));
-      loadResult();
-    });
-    elements.viewSwitch.addEventListener("click", (event) => {
-      const button = event.target.closest("[data-mode]");
-      if (!button) return;
-      state.currentViewMode = button.dataset.mode;
-      elements.viewSwitch.querySelectorAll("[data-mode]").forEach((item) => item.classList.toggle("active", item === button));
-      renderResultContent();
-    });
-    elements.copyResultButton.addEventListener("click", async () => {
-      if (!state.currentContent) return showToast("当前没有可复制的内容");
-      await navigator.clipboard.writeText(state.currentContent);
-      showToast("已复制 Markdown 内容");
-    });
-    elements.openResultButton.addEventListener("click", () => {
-      if (state.currentSource) callApi("open_result", state.currentSource, getSettings());
-    });
-
-    elements.settingsButton.addEventListener("click", () => elements.settingsOverlay.classList.remove("hidden"));
-    elements.closeSettingsButton.addEventListener("click", () => elements.settingsOverlay.classList.add("hidden"));
-    elements.settingsOverlay.addEventListener("click", (event) => {
-      if (event.target === elements.settingsOverlay) elements.settingsOverlay.classList.add("hidden");
-    });
-    elements.saveSettingsButton.addEventListener("click", () => {
-      saveLocalSettings();
-      elements.settingsOverlay.classList.add("hidden");
-      showToast("设置已保存");
-    });
-    elements.llmRepair.addEventListener("change", () => elements.llmKeyPanel.classList.toggle("hidden", !elements.llmRepair.checked));
-    document.querySelectorAll('input[name="outputMode"]').forEach((input) => {
-      input.addEventListener("change", () => elements.pathControl.classList.toggle("hidden", selectedOutputMode() !== "custom"));
-    });
-    elements.chooseOutputButton.addEventListener("click", async () => {
-      const response = await callApi("choose_output");
-      if (response?.path) elements.outputPath.value = response.path;
-    });
+    const thread = $("chatThread");
+    requestAnimationFrame(() => { thread.scrollTop = thread.scrollHeight; });
   }
 
-  function receive(event) {
-    if (!event) return;
-    if (event.snapshot) applySnapshot(event.snapshot);
-    if (event.message) showToast(event.message, event.level === "error" ? "error" : "info");
-    if (["file_done", "file_skipped", "llm_repair_done"].includes(event.type) && event.source === state.currentSource) {
-      loadResult();
+  function renderMessage(message, messageIndex) {
+    if (message.role === "user") return `<div class="message user"><div class="user-bubble">${escapeHtml(message.content)}</div></div>`;
+    const citations = (message.citations || []).map((citation, citationIndex) => `
+      <button class="citation" data-message-index="${messageIndex}" data-citation-index="${citationIndex}">
+        <span class="citation-icon"><i data-lucide="play"></i></span>
+        <span class="citation-copy"><strong>${escapeHtml(citation.title || "视频证据")}</strong><span>${escapeHtml(basename(citation.video_path))}</span></span>
+        ${citation.video_available === false
+          ? `<span class="text-button" data-relink-video="${escapeHtml(citation.video_id)}">重新关联</span>`
+          : `<span class="citation-time">${formatTime(citation.evidence_start)}</span>`}
+      </button>`).join("");
+    return `<div class="message assistant"><div class="assistant-message">
+      <span class="assistant-avatar">知</span>
+      <div class="assistant-body"><div class="assistant-answer">${escapeHtml(message.content)}</div>
+      ${citations ? `<div class="citation-list">${citations}</div>` : ""}
+      <div class="answer-meta">${message.error ? "未完成检索" : `${(message.citations || []).length} 条可核对证据`}</div></div>
+    </div></div>`;
+  }
+
+  function renderLoadingMessage() {
+    return `<div class="message assistant"><div class="assistant-message"><span class="assistant-avatar">知</span><div class="assistant-body"><div class="assistant-answer loading">正在检索当前目录，并整理有证据的回答…</div></div></div></div>`;
+  }
+
+  function formatTime(seconds) {
+    const value = Math.max(0, Math.round(Number(seconds || 0)));
+    const h = Math.floor(value / 3600);
+    const m = Math.floor((value % 3600) / 60);
+    const s = value % 60;
+    return h ? `${h}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}` : `${m}:${String(s).padStart(2,"0")}`;
+  }
+
+  async function playCitation(messageIndex, citationIndex) {
+    const citation = state.snapshot?.chat?.messages?.[messageIndex]?.citations?.[citationIndex];
+    if (!citation) return;
+    if (citation.video_available === false) {
+      await action("relink", () => callApi("relink_missing_video", citation.video_id));
+      return;
     }
+    await action("video", async () => {
+      const result = await callApi("get_video_source", citation.video_path, citation.evidence_start || 0);
+      if (!result?.uri) return;
+      const video = $("videoPlayer");
+      $("playerTitle").textContent = basename(citation.video_path);
+      $("playerMeta").textContent = `${citation.title || "视频证据"} · ${formatTime(citation.evidence_start)} — ${formatTime(citation.evidence_end)}`;
+      $("evidencePlayer").classList.remove("hidden");
+      video.src = result.uri;
+      video.onloadedmetadata = () => { video.currentTime = Number(result.start || 0); video.play().catch(() => {}); };
+    });
   }
 
-  async function initialize() {
-    cacheElements();
-    loadLocalSettings();
-    bindEvents();
-    const response = await callApi("bootstrap");
-    if (response?.snapshot) applySnapshot(response.snapshot);
+  function renderBusy() {
+    const mapping = {
+      space: ["spaceButton", "changeChatSpaceButton", "chooseSpacePromptButton"],
+      videos: ["chooseVideosButton", "addVideosButton", "appendVideosButton"], folder: ["chooseVideoFolderButton", "addFolderButton", "appendFolderButton"],
+      start: ["startTaskButton"], ai: ["testAiButton"], runtime: ["saveRuntimeButton"], chat: ["sendKnowledgeButton"]
+    };
+    Object.entries(mapping).forEach(([key, ids]) => ids.forEach((id) => { if ($(id)) $(id).disabled = state.busy.has(key); }));
   }
 
-  window.LocalTranscriber = { receive };
-  refreshIcons();
-  window.addEventListener("pywebviewready", initialize);
+  function switchView(view) {
+    state.activeView = view;
+    $("knowledgeGenerationView").classList.toggle("active-view", view === "generation");
+    $("knowledgeChatView").classList.toggle("active-view", view === "chat");
+    $("navGenerate").classList.toggle("active", view === "generation");
+    $("navChat").classList.toggle("active", view === "chat");
+    if (view === "chat") setTimeout(() => $("knowledgeComposer").focus(), 50);
+  }
+
+  function chooseSpace() {
+    if (!state.snapshot?.space?.ready) $("spacePrompt").classList.remove("hidden");
+    else action("space", () => callApi("choose_space"));
+  }
+
+  function openSettings() {
+    $("settingsModal").classList.remove("hidden");
+    $("aiTestResult").classList.add("hidden");
+    setTimeout(() => $("aiBaseUrl").focus(), 40);
+  }
+
+  function sendQuestion(prompt = "") {
+    const input = $("knowledgeComposer");
+    const question = String(prompt || input.value || "").trim();
+    if (!question) return;
+    if (!state.snapshot?.space?.ready) { chooseSpace(); return; }
+    input.value = "";
+    resizeComposer();
+    action("chat", () => callApi("ask_knowledge", question));
+  }
+
+  function resizeComposer() {
+    const input = $("knowledgeComposer");
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 130)}px`;
+  }
+
+  function bind() {
+    $("navGenerate").addEventListener("click", () => switchView("generation"));
+    $("navChat").addEventListener("click", () => switchView("chat"));
+    $("goChatButton").addEventListener("click", () => switchView("chat"));
+    $("spaceButton").addEventListener("click", chooseSpace);
+    $("changeChatSpaceButton").addEventListener("click", () => action("space", () => callApi("choose_space")));
+    $("chooseVideosButton").addEventListener("click", () => action("videos", () => callApi("choose_videos")));
+    $("addVideosButton").addEventListener("click", () => action("videos", () => callApi("choose_videos")));
+    $("appendVideosButton").addEventListener("click", () => action("videos", () => callApi("choose_videos")));
+    $("chooseVideoFolderButton").addEventListener("click", () => action("folder", () => callApi("choose_video_folder")));
+    $("addFolderButton").addEventListener("click", () => action("folder", () => callApi("choose_video_folder")));
+    $("appendFolderButton").addEventListener("click", () => action("folder", () => callApi("choose_video_folder")));
+    $("clearQueueButton").addEventListener("click", () => action("queue", () => callApi("clear_queue")));
+    $("startTaskButton").addEventListener("click", () => {
+      if (!state.snapshot?.space?.ready) { chooseSpace(); return; }
+      action("start", () => callApi("start_knowledge_task"));
+    });
+    $("confirmHotwordsButton").addEventListener("click", () => action("hotwords", () => callApi("confirm_hotwords", $("hotwordInput").value, $("hotwordCategory").value)));
+    $("pauseButton").addEventListener("click", () => action("task", () => callApi("pause_task")));
+    $("resumeButton").addEventListener("click", () => action("task", () => callApi("resume_task")));
+    $("cancelButton").addEventListener("click", () => {
+      if (window.confirm("停止当前任务？已经完成的知识成果会保留。")) action("task", () => callApi("cancel_task"));
+    });
+    $("retryButton").addEventListener("click", () => action("task", () => callApi("continue_knowledge_task")));
+    $("cleanupButton").addEventListener("click", () => {
+      if (window.confirm("确认已验收结果，并删除本次任务的临时转录与校对文件？视频、索引和 Obsidian 知识库不会删除。")) action("cleanup", () => callApi("cleanup_task"));
+    });
+    $("settingsButton").addEventListener("click", openSettings);
+    $("openSettingsInline").addEventListener("click", openSettings);
+    $("closeSettingsButton").addEventListener("click", () => $("settingsModal").classList.add("hidden"));
+    $("settingsModal").addEventListener("click", (event) => { if (event.target === $("settingsModal")) $("settingsModal").classList.add("hidden"); });
+    $("testAiButton").addEventListener("click", () => action("ai", async () => {
+      const resultBox = $("aiTestResult");
+      resultBox.className = "inline-result";
+      resultBox.textContent = "正在连接并发送最小测试请求…";
+      const result = await callApi("test_and_save_ai", $("aiBaseUrl").value, $("aiModel").value, $("aiApiKey").value, $("aiContextWindow").value);
+      $("aiApiKey").value = "";
+      resultBox.className = "inline-result success";
+      resultBox.textContent = result.message || "连接成功，设置已保存。";
+    }));
+    $("saveRuntimeButton").addEventListener("click", () => action("runtime", () => callApi("save_runtime_settings", $("runtimeModel").value, $("runtimeDevice").value, $("runtimeLanguage").value, $("tempPolicy").value)));
+    $("toggleApiKey").addEventListener("click", () => { $("aiApiKey").type = $("aiApiKey").type === "password" ? "text" : "password"; });
+    $("chooseSpacePromptButton").addEventListener("click", () => action("space", async () => { await callApi("choose_space"); $("spacePrompt").classList.add("hidden"); }));
+    $("cancelSpacePromptButton").addEventListener("click", () => $("spacePrompt").classList.add("hidden"));
+    $("sendKnowledgeButton").addEventListener("click", () => sendQuestion());
+    $("knowledgeComposer").addEventListener("input", resizeComposer);
+    $("knowledgeComposer").addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendQuestion(); } });
+    document.querySelectorAll("[data-prompt]").forEach((button) => button.addEventListener("click", () => sendQuestion(button.dataset.prompt)));
+    $("clearChatButton").addEventListener("click", () => action("chat-clear", () => callApi("clear_chat")));
+    $("closePlayerButton").addEventListener("click", () => { $("videoPlayer").pause(); $("videoPlayer").removeAttribute("src"); $("evidencePlayer").classList.add("hidden"); });
+  }
+
+  window.LocalTranscriber = {
+    receive(payload) {
+      if (payload?.snapshot) applySnapshot(payload.snapshot);
+      if (payload?.message && ["task_done", "task_error"].includes(payload.type)) toast(payload.message, payload.level === "error" ? "error" : "success");
+    }
+  };
+
+  async function boot() {
+    if (bootPromise) return bootPromise;
+    initializeUi();
+    bootPromise = (async () => {
+      try {
+        const result = await callApi("bootstrap");
+        if (!result?.snapshot) throw new Error("无法读取应用状态");
+      } catch (error) {
+        toast(error?.message || String(error), "error");
+        window.setTimeout(() => { bootPromise = null; boot(); }, 1200);
+      }
+    })();
+    return bootPromise;
+  }
+
+  function initializeUi() {
+    if (uiBound) return;
+    uiBound = true;
+    bind();
+    icons();
+  }
+
+  initializeUi();
+  window.addEventListener("pywebviewready", boot, { once: true });
+  if (currentDesktopApi()) boot();
 })();

@@ -29,7 +29,9 @@ if RUNTIME_DIR.is_dir():
 from faster_whisper import WhisperModel
 from llm_repair import DEFAULT_MODEL as DEFAULT_LLM_MODEL
 from llm_repair import repair_transcript_file
+from llm_client import DEFAULT_LOCAL_BASE_URL, OpenAICompatibleClient
 from source_context import load_source_context
+from task_hotwords import TaskHotwordDiscovery
 EVENT_PREFIX = "@@LOCAL_TRANSCRIBER_EVENT@@"
 DEFAULT_PROMPT = ""
 
@@ -234,8 +236,12 @@ def transcribe_one(
     context_mode: str = "isolated",
     llm_repair_enabled: bool = False,
     llm_model: str = DEFAULT_LLM_MODEL,
+    llm_provider: str = "deepseek",
+    llm_base_url: str = DEFAULT_LOCAL_BASE_URL,
     gui_events: bool = False,
     output_stem: str | None = None,
+    task_hotword_discovery: TaskHotwordDiscovery | None = None,
+    emit_completion: bool = True,
 ) -> list[Path]:
     output_dir = choose_output_dir(source, output_arg)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -246,9 +252,21 @@ def transcribe_one(
     started = time.time()
     source_context = source_context or {}
     context_terms = [str(item) for item in source_context.get("terms", [])]
-    hotwords = ", ".join(item for item in [*context_terms, prompt] if item)
+    def current_hotwords() -> str:
+        task_words = (
+            task_hotword_discovery.hotwords
+            if task_hotword_discovery is not None and task_hotword_discovery.ready
+            else []
+        )
+        return ", ".join(dict.fromkeys(item for item in [*context_terms, prompt, *task_words] if item))
+
+    hotwords = current_hotwords()
     initial_prompt = str(source_context.get("initial_prompt", ""))
-    def decode(keep_previous: bool, decode_hotwords: str) -> tuple[list[dict[str, object]], object]:
+    def decode(
+        keep_previous: bool,
+        decode_hotwords: str,
+        clip_timestamps: list[float] | str = "0",
+    ) -> tuple[list[dict[str, object]], object]:
         segments_iter, decode_info = model.transcribe(
             str(source),
             language=language,
@@ -264,6 +282,7 @@ def transcribe_one(
             word_timestamps=False,
             multilingual=True,
             language_detection_segments=3,
+            clip_timestamps=clip_timestamps,
         )
         decoded: list[dict[str, object]] = []
         for segment in segments_iter:
@@ -303,6 +322,9 @@ def transcribe_one(
 
     effective_context_mode = context_mode
     fallback_used = False
+    if task_hotword_discovery is not None and not task_hotword_discovery.ready:
+        raise RuntimeError("任务热词尚未准备完成，不能开始全量转录")
+    hotwords = current_hotwords()
     segments, info = decode(context_mode == "continuous", hotwords)
     if repetition_risk(segments):
         fallback_used = True
@@ -342,6 +364,15 @@ def transcribe_one(
         "entity_corrections": entity_corrections,
         "source_context": source_context,
         "hotwords": hotwords,
+        "task_hotwords": {
+            "enabled": task_hotword_discovery is not None,
+            "status": task_hotword_discovery.status if task_hotword_discovery else "disabled",
+            "category": task_hotword_discovery.category if task_hotword_discovery else "",
+            "tags": task_hotword_discovery.tags if task_hotword_discovery else [],
+            "terms": task_hotword_discovery.hotwords if task_hotword_discovery else [],
+            "source_set_ids": task_hotword_discovery.source_set_ids if task_hotword_discovery else [],
+            "state_file": str(task_hotword_discovery.state_file) if task_hotword_discovery else "",
+        },
         "segments": segments,
     }
 
@@ -386,44 +417,149 @@ def transcribe_one(
 
     outputs = [md_path, txt_path, srt_path, json_path]
     if llm_repair_enabled:
-        api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
-        if not api_key:
-            raise RuntimeError("已启用 DeepSeek 校订，但没有提供 API Key")
-        print(f"正在使用 {llm_model} 结合上下文校订…", flush=True)
-        emit_event(gui_events, "llm_repair_start", source=str(source), model=llm_model)
-
-        def report_llm_progress(current: int, total: int) -> None:
-            progress_value = current / max(total, 1) * 100
-            print(f"DeepSeek 校订进度：{current}/{total}", flush=True)
-            emit_event(
-                gui_events,
-                "llm_repair_progress",
-                source=str(source),
-                progress=round(progress_value, 2),
-                current=current,
-                total=total,
-            )
-
-        llm_outputs = repair_transcript_file(json_path, api_key, llm_model, report_llm_progress)
-        outputs.extend(llm_outputs)
-        emit_event(
-            gui_events,
-            "llm_repair_done",
-            source=str(source),
-            model=llm_model,
-            outputs=[str(path) for path in llm_outputs],
+        llm_outputs = repair_one_transcript(
+            source, json_path, llm_model, llm_provider, llm_base_url, gui_events
         )
+        outputs.extend(llm_outputs)
 
     print(f"完成，用时 {elapsed / 60:.1f} 分钟。输出目录：{output_dir}")
     emit_event(
         gui_events,
-        "file_done",
+        "file_done" if emit_completion else "file_transcribed",
         source=str(source),
         output_dir=str(output_dir),
         processing_seconds=round(elapsed, 2),
         outputs=[str(path) for path in outputs],
     )
     return outputs
+
+
+def repair_one_transcript(
+    source: Path,
+    json_path: Path,
+    llm_model: str,
+    llm_provider: str,
+    llm_base_url: str,
+    gui_events: bool,
+) -> list[Path]:
+    api_key = os.environ.get("LLM_API_KEY", os.environ.get("DEEPSEEK_API_KEY", "")).strip()
+    if llm_provider == "deepseek" and not api_key:
+        raise RuntimeError("已启用 DeepSeek 校订，但没有提供 API Key")
+    provider_label = "本地模型" if llm_provider == "local" else "OpenAI 兼容 API"
+    print(f"正在使用{provider_label} {llm_model} 结合上下文校订…", flush=True)
+    emit_event(gui_events, "llm_repair_start", source=str(source), model=llm_model, provider=llm_provider)
+
+    def report_llm_progress(current: int, total: int) -> None:
+        progress_value = current / max(total, 1) * 100
+        print(f"{provider_label}校订进度：{current}/{total}", flush=True)
+        emit_event(gui_events, "llm_repair_progress", source=str(source), progress=round(progress_value, 2), current=current, total=total)
+
+    llm_outputs = repair_transcript_file(
+        json_path, api_key, llm_model, report_llm_progress,
+        provider=llm_provider, base_url=llm_base_url,
+    )
+    suggestion_count = 0
+    accepted_count = 0
+    suggestion_path = next((path for path in llm_outputs if path.name.endswith(".hotword-suggestions.json")), None)
+    repaired_json = next((path for path in llm_outputs if path.name.endswith(".llm.json")), None)
+    try:
+        if suggestion_path is not None:
+            suggestion_count = len(json.loads(suggestion_path.read_text(encoding="utf-8")).get("suggestions", []))
+        if repaired_json is not None:
+            accepted_count = int(json.loads(repaired_json.read_text(encoding="utf-8")).get("llm_repair", {}).get("accepted_corrections", 0))
+    except (OSError, UnicodeError, json.JSONDecodeError, AttributeError, TypeError, ValueError):
+        pass
+    emit_event(
+        gui_events, "llm_repair_done", source=str(source), model=llm_model,
+        provider=llm_provider, outputs=[str(path) for path in llm_outputs],
+        suggestion_count=suggestion_count, accepted_count=accepted_count,
+    )
+    return llm_outputs
+
+
+def representative_hotword_sources(sources: list[Path], limit: int = 3) -> list[Path]:
+    if len(sources) <= limit:
+        return list(sources)
+    indexes = [0, len(sources) // 2, len(sources) - 1]
+    return [sources[index] for index in dict.fromkeys(indexes)]
+
+
+def prepare_task_hotwords(
+    sources: list[Path],
+    model: WhisperModel,
+    language: str | None,
+    discovery: TaskHotwordDiscovery,
+    gui_events: bool = False,
+) -> None:
+    selected = representative_hotword_sources(sources)
+    sample_seconds = discovery.discovery_seconds if len(sources) == 1 else min(90.0, discovery.discovery_seconds)
+    emit_event(
+        gui_events,
+        "task_hotwords_preparing",
+        total=len(selected),
+        sample_seconds=sample_seconds,
+        state_file=str(discovery.state_file),
+    )
+    for index, source in enumerate(selected, start=1):
+        emit_event(
+            gui_events,
+            "task_hotwords_sample_start",
+            source=str(source),
+            current=index,
+            total=len(selected),
+        )
+        segments_iter, _info = model.transcribe(
+            str(source),
+            language=language,
+            task="transcribe",
+            beam_size=5,
+            patience=1.0,
+            temperature=0.0,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 300},
+            condition_on_previous_text=False,
+            initial_prompt=None,
+            hotwords=None,
+            word_timestamps=False,
+            multilingual=True,
+            language_detection_segments=3,
+            clip_timestamps=[0.0, sample_seconds],
+        )
+        sample_segments = [
+            {"start": segment.start, "end": segment.end, "text": segment.text.strip()}
+            for segment in segments_iter
+            if segment.text.strip()
+        ]
+        sample_chars = discovery.add_sample(source, sample_segments)
+        emit_event(
+            gui_events,
+            "task_hotwords_sample_done",
+            source=str(source),
+            current=index,
+            total=len(selected),
+            sample_chars=sample_chars,
+        )
+    if discovery.sample_chars < discovery.min_chars:
+        discovery.status = "error"
+        discovery.error = f"样本文字不足（{discovery.sample_chars}/{discovery.min_chars} 字）"
+        discovery.save()
+        raise RuntimeError("样本文字不足，无法生成可靠热词；请添加更多内容或选择直接转录")
+    emit_event(
+        gui_events,
+        "task_hotwords_extracting",
+        sample_chars=discovery.sample_chars,
+        state_file=str(discovery.state_file),
+    )
+    if not discovery.extract():
+        reason = discovery.error or "远程 API 没有返回有效热词"
+        raise RuntimeError(reason)
+    emit_event(
+        gui_events,
+        "task_hotwords_ready",
+        category=discovery.category,
+        hotwords=discovery.hotwords,
+        state_file=str(discovery.state_file),
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -437,8 +573,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-url", help="视频来源页面；自动提取标题、人名和专业词汇")
     parser.add_argument("--source-url-map", help="JSON 文件：媒体绝对路径到来源网址的映射，支持批量任务")
     parser.add_argument("--refresh-source-context", action="store_true", help="忽略来源上下文缓存并重新获取")
-    parser.add_argument("--llm-repair", action="store_true", help="转写后使用 DeepSeek 进行上下文校订")
-    parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL, help="DeepSeek 校订模型")
+    parser.add_argument("--llm-repair", action="store_true", help="转写后使用大模型进行上下文校订")
+    parser.add_argument("--llm-provider", choices=["deepseek", "local", "openai"], default="openai")
+    parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL, help="校订模型名称")
+    parser.add_argument("--llm-base-url", default=DEFAULT_LOCAL_BASE_URL, help="OpenAI 兼容 API 基础地址")
+    parser.add_argument("--hotword-api-base-url", help="任务热词使用的远程 OpenAI 兼容 API 基础地址")
+    parser.add_argument("--hotword-api-model", help="任务热词 API 模型名称")
+    parser.add_argument("--hotword-task-file", type=Path, help="任务热词状态文件")
+    parser.add_argument("--hotword-reuse-file", type=Path, help="直接复用已经生成完成的任务热词文件")
+    parser.add_argument("--hotword-discovery-seconds", type=float, default=180.0)
     parser.add_argument(
         "--context-mode",
         choices=["continuous", "isolated"],
@@ -542,6 +685,75 @@ def main() -> int:
                 emit_event(args.gui_events, "file_error", source=str(source), error=error)
             pending.clear()
 
+    task_hotword_discovery: TaskHotwordDiscovery | None = None
+    hotword_api_key = os.environ.get("HOTWORD_API_KEY", "").strip()
+    if pending and args.hotword_reuse_file:
+        try:
+            task_hotword_discovery = TaskHotwordDiscovery.from_file(
+                args.hotword_reuse_file.expanduser().resolve()
+            )
+            emit_event(
+                args.gui_events,
+                "task_hotwords_ready",
+                category=task_hotword_discovery.category,
+                hotwords=task_hotword_discovery.hotwords,
+                state_file=str(task_hotword_discovery.state_file),
+                reused=True,
+            )
+        except (OSError, ValueError, RuntimeError) as exc:
+            error = f"复用热词失败：{exc}"
+            print(error, file=sys.stderr, flush=True)
+            emit_event(args.gui_events, "task_hotwords_error", error=error)
+            for source, _output_stem in pending:
+                failed += 1
+                emit_event(args.gui_events, "file_error", source=str(source), error=error)
+            pending.clear()
+    elif pending and args.hotword_api_base_url and args.hotword_api_model and args.hotword_task_file:
+        if not hotword_api_key:
+            error = "任务选择了热词增强，但没有提供远程 API Key"
+            print(error, file=sys.stderr, flush=True)
+            emit_event(args.gui_events, "task_hotwords_error", error=error)
+            for source, _output_stem in pending:
+                failed += 1
+                emit_event(args.gui_events, "file_error", source=str(source), error=error)
+            pending.clear()
+        else:
+            try:
+                hotword_client = OpenAICompatibleClient(
+                    base_url=args.hotword_api_base_url,
+                    model=args.hotword_api_model,
+                    api_key=hotword_api_key,
+                    allow_remote=True,
+                )
+                task_hotword_discovery = TaskHotwordDiscovery(
+                    hotword_client,
+                    args.hotword_task_file.expanduser().resolve(),
+                    discovery_seconds=args.hotword_discovery_seconds,
+                    min_chars=300,
+                )
+                assert model is not None
+                prepare_task_hotwords(
+                    [source for source, _output_stem in pending],
+                    model,
+                    language,
+                    task_hotword_discovery,
+                    args.gui_events,
+                )
+            except (OSError, ValueError, RuntimeError) as exc:
+                error = f"热词准备失败：{exc}"
+                print(error, file=sys.stderr, flush=True)
+                emit_event(
+                    args.gui_events,
+                    "task_hotwords_error",
+                    error=error,
+                    state_file=str(args.hotword_task_file),
+                )
+                for source, _output_stem in pending:
+                    failed += 1
+                    emit_event(args.gui_events, "file_error", source=str(source), error=error)
+                pending.clear()
+
+    deferred_repairs: list[tuple[Path, list[Path]]] = []
     for source, output_stem in pending:
         try:
             assert model is not None
@@ -576,7 +788,7 @@ def main() -> int:
                         term_count=len(terms),
                         cache_hit=source_context.get("cache_hit", False),
                     )
-            transcribe_one(
+            raw_outputs = transcribe_one(
                 source,
                 model,
                 args.model,
@@ -587,12 +799,19 @@ def main() -> int:
                 args.prompt,
                 source_context,
                 args.context_mode,
-                args.llm_repair,
+                False,
                 args.llm_model,
+                args.llm_provider,
+                args.llm_base_url,
                 args.gui_events,
                 output_stem,
+                task_hotword_discovery,
+                emit_completion=not args.llm_repair,
             )
-            completed += 1
+            if args.llm_repair:
+                deferred_repairs.append((source, raw_outputs))
+            else:
+                completed += 1
         except Exception as exc:
             failed += 1
             print(f"转写失败：{source}\n{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
@@ -602,6 +821,25 @@ def main() -> int:
                 source=str(source),
                 error=f"{type(exc).__name__}: {exc}",
             )
+    if args.llm_repair and deferred_repairs:
+        emit_event(args.gui_events, "transcription_phase_done", total=len(deferred_repairs))
+        for source, raw_outputs in deferred_repairs:
+            try:
+                json_path = next(path for path in raw_outputs if path.suffix.lower() == ".json")
+                llm_outputs = repair_one_transcript(
+                    source, json_path, args.llm_model, args.llm_provider,
+                    args.llm_base_url, args.gui_events,
+                )
+                outputs = [*raw_outputs, *llm_outputs]
+                emit_event(
+                    args.gui_events, "file_done", source=str(source),
+                    output_dir=str(json_path.parent), outputs=[str(path) for path in outputs],
+                )
+                completed += 1
+            except Exception as exc:
+                failed += 1
+                print(f"校对失败：{source}\n{type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+                emit_event(args.gui_events, "file_error", source=str(source), error=f"{type(exc).__name__}: {exc}")
     emit_event(
         args.gui_events,
         "batch_done",

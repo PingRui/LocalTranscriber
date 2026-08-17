@@ -10,18 +10,38 @@ import model_manager
 
 
 class AppConfigTests(unittest.TestCase):
+    def test_console_output_survives_legacy_windows_encoding(self):
+        class LegacyStream:
+            encoding = "cp1252"
+
+            def __init__(self):
+                self.parts = []
+
+            def write(self, value):
+                safe = value.encode(self.encoding, errors="strict").decode(self.encoding)
+                self.parts.append(safe)
+                return len(value)
+
+            def flush(self):
+                return None
+
+        stream = LegacyStream()
+        with patch.object(model_manager.sys, "stdout", stream):
+            model_manager.print_console("正在下载模型…")
+        self.assertTrue(stream.parts)
+
     def test_config_uses_user_state_directory_and_round_trips(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             config_path = root / "config.json"
             with patch.dict(os.environ, {"LOCALTRANSCRIBER_STATE_DIR": str(root)}, clear=False):
                 default = app_config.default_config()
-                self.assertEqual(Path(default["model_root"]), root / "models")
+                self.assertEqual(Path(default["model_root"]).resolve(), (root / "models").resolve())
                 default["default_model"] = "large-v3-turbo"
                 saved = app_config.save_config(default, config_path)
                 loaded = app_config.load_config(saved)
                 self.assertEqual(loaded["default_model"], "large-v3-turbo")
-                self.assertEqual(Path(loaded["model_root"]), root / "models")
+                self.assertEqual(Path(loaded["model_root"]).resolve(), (root / "models").resolve())
 
     def test_invalid_values_fall_back_to_safe_defaults(self):
         config = app_config.normalize_config(
@@ -58,13 +78,16 @@ class AppConfigTests(unittest.TestCase):
             ) as snapshot_download:
                 result = model_manager.install_model("large-v3-turbo")
 
-            self.assertEqual(result, destination)
+            self.assertEqual(result.resolve(), destination.resolve())
             snapshot_download.assert_called_once()
             self.assertEqual(
                 snapshot_download.call_args.kwargs["repo_id"],
                 app_config.MODEL_REPOSITORIES["large-v3-turbo"],
             )
-            self.assertEqual(snapshot_download.call_args.kwargs["local_dir"], destination)
+            self.assertEqual(
+                Path(snapshot_download.call_args.kwargs["local_dir"]).resolve(),
+                destination.resolve(),
+            )
             self.assertEqual(save_config.call_args.args[0]["default_model"], "large-v3-turbo")
 
 

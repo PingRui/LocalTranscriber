@@ -1,235 +1,250 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>LocalTranscriber</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>视频知识空间</title>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand">LocalTranscriber</div>
-      <nav class="primary-nav" aria-label="主要功能">
-        <button class="nav-item active" id="navUpload" type="button">
-          <i data-lucide="circle-plus" class="lucide-icon icon-19" aria-hidden="true"></i>
-          <span>上传视频</span>
+      <div class="brand">
+        <div class="brand-mark">知</div>
+        <div>
+          <strong>视频知识空间</strong>
+          <span>本地知识工作台</span>
+        </div>
+      </div>
+
+      <nav class="main-nav" aria-label="主导航">
+        <button id="navGenerate" class="nav-item active" data-view="generation">
+          <i data-lucide="sparkles"></i><span>生成知识</span>
         </button>
-        <button class="nav-item" id="navContent" type="button">
-          <i data-lucide="history" class="lucide-icon icon-19" aria-hidden="true"></i>
-          <span>内容</span>
+        <button id="navChat" class="nav-item" data-view="chat">
+          <i data-lucide="message-square-text"></i><span>知识检索</span>
         </button>
       </nav>
 
-      <section class="recent-section" aria-labelledby="recentTitle">
-        <h2 id="recentTitle">最近记录</h2>
-        <div class="recent-list" id="recentList">
-          <p class="recent-empty">暂无记录</p>
-        </div>
+      <section class="recent-section">
+        <div class="section-label">最近的知识空间</div>
+        <div id="recentSpaces" class="recent-list"></div>
       </section>
 
-      <div class="sidebar-settings-wrap">
-        <button class="settings-entry" id="settingsButton" type="button">
-          <i data-lucide="settings" class="lucide-icon icon-19" aria-hidden="true"></i>
-          <span>设置</span>
+      <div class="sidebar-bottom">
+        <button id="settingsButton" class="nav-item secondary">
+          <i data-lucide="settings-2"></i><span>设置</span>
+          <span id="settingsStatusDot" class="status-dot"></span>
         </button>
+        <div class="local-note"><i data-lucide="hard-drive"></i> 成果只保存在你选择的位置</div>
       </div>
     </aside>
 
-    <main class="main-workspace">
-      <section class="module-view upload-view" id="uploadView" aria-label="上传视频">
-        <div class="upload-card">
-          <div class="dropzone" id="dropzone">
-            <i data-lucide="upload" class="lucide-icon dropzone-lucide" aria-hidden="true"></i>
-            <p class="dropzone-title">拖拽文件或文件夹至此</p>
-            <p class="dropzone-help">支持 MP4、WAV、MP3 等常用格式</p>
-            <div class="dropzone-actions">
-              <button class="secondary-button" id="selectFilesButton" type="button">选择文件</button>
-              <button class="secondary-button" id="selectFolderButton" type="button">选择文件夹</button>
-            </div>
+    <main class="workspace">
+      <section id="knowledgeGenerationView" class="view active-view">
+        <header class="topbar">
+          <div>
+            <div class="eyebrow">生成知识</div>
+            <h1 id="generationTitle">把视频变成可检索的知识</h1>
           </div>
+          <button id="spaceButton" class="space-picker">
+            <span class="space-icon"><i data-lucide="folder-kanban"></i></span>
+            <span class="space-copy">
+              <small>当前知识空间</small>
+              <strong id="spaceName">尚未选择</strong>
+            </span>
+            <i data-lucide="chevron-down"></i>
+          </button>
+        </header>
 
-          <section class="queue-region" aria-labelledby="queueTitle">
-            <header class="queue-header">
-              <div class="queue-title-row">
-                <h2 id="queueTitle">待处理视频</h2>
-                <span class="count-badge" id="fileCount">0 个</span>
-              </div>
-              <div class="queue-actions">
-                <button class="text-button" id="addMoreButton" type="button">继续添加</button>
-                <button class="text-button muted" id="clearButton" type="button" disabled>清空</button>
-              </div>
-            </header>
-            <div class="queue-list" id="queueList">
-              <div class="queue-empty" id="queueEmpty">添加文件后将在这里显示处理列表</div>
+        <div class="generation-scroll">
+          <section id="emptyGeneration" class="empty-generation panel">
+            <div class="empty-illustration"><i data-lucide="video"></i></div>
+            <h2>选择要整理的视频</h2>
+            <p>可以添加几个视频，也可以扫描文件夹下的全部视频。开始后，视频会复制到知识空间，原文件不会被移动或删除。</p>
+            <div class="primary-actions">
+              <button id="chooseVideosButton" class="button primary"><i data-lucide="file-video"></i>选择视频</button>
+              <button id="chooseVideoFolderButton" class="button"><i data-lucide="folder-search"></i>扫描文件夹</button>
+            </div>
+            <div class="flow-preview">
+              <span>本地样本</span><i data-lucide="arrow-right"></i>
+              <span>专业词汇</span><i data-lucide="arrow-right"></i>
+              <span>全文与校对</span><i data-lucide="arrow-right"></i>
+              <span>知识索引</span>
             </div>
           </section>
 
-          <section class="run-area">
-            <div class="run-progress hidden" id="runProgress">
-              <div class="progress-line">
-                <span id="statusText">准备开始</span>
-                <span id="progressText">0%</span>
+          <section id="queuePanel" class="queue-panel panel hidden">
+            <div class="panel-heading">
+              <div>
+                <span class="step-badge">1</span>
+                <div><h2>确认待处理视频</h2><p id="queueSummary">0 个视频</p></div>
               </div>
-              <div class="progress-track"><span id="progressFill"></span></div>
+              <div class="compact-actions">
+                <button id="addVideosButton" class="text-button"><i data-lucide="plus"></i>添加视频</button>
+                <button id="addFolderButton" class="text-button"><i data-lucide="folder-plus"></i>扫描文件夹</button>
+                <button id="clearQueueButton" class="text-button muted">清空</button>
+              </div>
             </div>
-            <div class="run-actions">
-              <button class="secondary-button hidden" id="pauseButton" type="button">暂停</button>
-              <button class="danger-text-button hidden" id="cancelButton" type="button">取消</button>
-              <button class="primary-button start-button" id="startButton" type="button" disabled>开始任务</button>
+            <div id="queueList" class="queue-list"></div>
+            <div class="start-row">
+              <div id="readinessCard" class="readiness-card">
+                <span class="readiness-icon"><i data-lucide="key-round"></i></span>
+                <div><strong id="readinessTitle">AI 服务尚未配置</strong><p id="readinessText">完成连接测试后才能开始。</p></div>
+                <button id="openSettingsInline" class="text-button">打开设置</button>
+              </div>
+              <button id="startTaskButton" class="button primary large"><i data-lucide="play"></i>开始生成知识</button>
+            </div>
+          </section>
+
+          <section id="taskPanel" class="task-panel panel hidden">
+            <div class="task-head">
+              <div>
+                <div class="running-label"><span class="pulse-dot"></span><span id="taskStatusLabel">正在处理</span></div>
+                <h2 id="currentVideoName">准备任务</h2>
+                <p id="taskStatusText">正在建立临时工作区</p>
+                <p id="taskQueueSummary" class="task-queue-summary"></p>
+              </div>
+              <div class="overall-progress"><strong id="overallProgress">0%</strong><span>整体进度</span></div>
+            </div>
+            <div class="progress-track"><span id="overallProgressBar"></span></div>
+
+            <div class="task-grid">
+              <div>
+                <h3 class="subheading">执行路径</h3>
+                <div id="taskStages" class="task-stages"></div>
+              </div>
+              <aside class="activity-panel">
+                <h3 class="subheading">实时状态</h3>
+                <div id="activityList" class="activity-list"></div>
+              </aside>
+            </div>
+
+            <div id="hotwordConfirmCard" class="confirmation-card hidden">
+              <div class="confirmation-icon"><i data-lucide="spell-check-2"></i></div>
+              <div class="confirmation-main">
+                <div class="confirmation-title"><strong>确认专业词汇</strong><input id="hotwordCategory" maxlength="80" aria-label="内容分类" placeholder="内容分类"></div>
+                <p>系统只会在判断不可靠时停在这里。请确认内容分类和专业词汇，修改后继续。</p>
+                <div id="hotwordReason" class="confirmation-reason"></div>
+                <textarea id="hotwordInput" rows="3" placeholder="用逗号分隔专业词汇"></textarea>
+              </div>
+              <button id="confirmHotwordsButton" class="button primary">确认并继续</button>
+            </div>
+
+            <div class="task-footer">
+              <div id="runningActions" class="compact-actions">
+                <button id="pauseButton" class="button small"><i data-lucide="pause"></i>暂停</button>
+                <button id="resumeButton" class="button small hidden"><i data-lucide="play"></i>继续</button>
+                <button id="appendVideosButton" class="button small hidden"><i data-lucide="file-plus-2"></i>追加文件</button>
+                <button id="appendFolderButton" class="button small hidden"><i data-lucide="folder-plus"></i>追加文件夹</button>
+                <button id="cancelButton" class="button small danger-ghost"><i data-lucide="square"></i>取消</button>
+              </div>
+              <div id="failedActions" class="compact-actions hidden">
+                <button id="retryButton" class="button primary"><i data-lucide="history"></i>从断点继续</button>
+              </div>
+              <div id="completedActions" class="compact-actions hidden">
+                <button id="goChatButton" class="button primary"><i data-lucide="message-square-text"></i>开始检索</button>
+                <button id="cleanupButton" class="button subtle"><i data-lucide="trash-2"></i>验收并清理临时文件</button>
+              </div>
             </div>
           </section>
         </div>
       </section>
 
-      <section class="module-view content-view hidden" id="contentView" aria-label="内容">
-        <section class="history-view" id="historyView">
-          <header class="content-page-header">
-            <h1>内容</h1>
-            <label class="search-box">
-              <i data-lucide="search" class="lucide-icon search-lucide" aria-hidden="true"></i>
-              <input id="historySearch" type="search" placeholder="搜索文件">
-            </label>
-          </header>
-          <div class="history-filters" id="historyFilters">
-            <button class="filter-button active" data-filter="all" type="button">全部</button>
-            <button class="filter-button" data-filter="processing" type="button">处理中</button>
-            <button class="filter-button" data-filter="completed" type="button">已完成</button>
-            <button class="filter-button" data-filter="failed" type="button">失败</button>
+      <section id="knowledgeChatView" class="view chat-view">
+        <header class="chat-topbar">
+          <div class="chat-space">
+            <span class="space-icon"><i data-lucide="library"></i></span>
+            <div><small>正在检索</small><strong id="chatSpaceName">尚未选择知识空间</strong></div>
           </div>
-          <div class="history-list" id="historyList">
-            <div class="content-empty">还没有转写记录</div>
+          <div class="compact-actions">
+            <button id="changeChatSpaceButton" class="icon-text-button"><i data-lucide="folder-cog"></i>切换目录</button>
+            <button id="clearChatButton" class="icon-button" title="清空对话"><i data-lucide="rotate-ccw"></i></button>
           </div>
-        </section>
+        </header>
 
-        <section class="detail-view hidden" id="detailView">
-          <header class="detail-header">
-            <div class="detail-title-area">
-              <button class="back-button" id="backToHistoryButton" type="button" aria-label="返回内容列表"><i data-lucide="arrow-left" class="lucide-icon icon-19" aria-hidden="true"></i></button>
-              <div class="detail-title-copy">
-                <h1 id="detailTitle">转写内容</h1>
-                <span class="status-pill" id="detailStatus">等待中</span>
-              </div>
-            </div>
-            <div class="detail-actions">
-              <button class="icon-action" id="copyResultButton" type="button" title="复制内容"><i data-lucide="copy" class="lucide-icon icon-17" aria-hidden="true"></i></button>
-              <button class="icon-action" id="openResultButton" type="button" title="打开结果文件夹"><i data-lucide="folder-open" class="lucide-icon icon-17" aria-hidden="true"></i></button>
-            </div>
-          </header>
-
-          <div class="detail-progress hidden" id="detailProgress">
-            <div class="progress-line">
-              <span id="detailProgressStatus">处理中</span>
-              <span id="detailProgressText">0%</span>
-            </div>
-            <div class="progress-track"><span id="detailProgressFill"></span></div>
-          </div>
-
-          <div class="viewer-toolbar">
-            <div class="material-tabs" id="materialTabs">
-              <button class="material-tab active" data-material="accurate" type="button">准确稿.md</button>
-              <button class="material-tab" data-material="raw" type="button">原始转写.md</button>
-              <button class="material-tab" data-material="corrections" type="button">校订记录.md</button>
-            </div>
-            <div class="view-switch" id="viewSwitch">
-              <button class="active" data-mode="preview" type="button">预览</button>
-              <button data-mode="source" type="button">Markdown 源码</button>
+        <div id="chatThread" class="chat-thread">
+          <div id="chatEmpty" class="chat-empty">
+            <div class="chat-orb"><i data-lucide="search"></i></div>
+            <h1>从视频知识中找到准确答案</h1>
+            <p>输入问题，我会先检索当前目录，再用已校对的知识回答。每个答案都能回到对应视频时间点核对。</p>
+            <div class="example-prompts">
+              <button data-prompt="这个知识空间主要讲了哪些内容？">这个知识空间主要讲了哪些内容？</button>
+              <button data-prompt="帮我找到最关键的三个知识点">帮我找到最关键的三个知识点</button>
+              <button data-prompt="有哪些容易理解错误的概念？">有哪些容易理解错误的概念？</button>
             </div>
           </div>
+          <div id="messageList" class="message-list"></div>
+        </div>
 
-          <div class="viewer-body">
-            <article class="markdown-body" id="markdownPreview">
-              <div class="content-empty">完成转写后可在这里查看 Markdown</div>
-            </article>
-            <pre class="markdown-source hidden" id="markdownSource"></pre>
+        <div class="composer-wrap">
+          <div class="composer">
+            <textarea id="knowledgeComposer" rows="1" placeholder="询问当前知识空间…"></textarea>
+            <button id="sendKnowledgeButton" class="send-button" title="发送"><i data-lucide="arrow-up"></i></button>
           </div>
-        </section>
+          <div class="composer-hint"><span id="knowledgeCountHint">0 个知识点</span><span>答案仅依据当前目录中的可信内容</span></div>
+        </div>
+
+        <div id="evidencePlayer" class="evidence-player hidden">
+          <div class="player-head">
+            <div><span>视频证据</span><strong id="playerTitle">—</strong></div>
+            <button id="closePlayerButton" class="icon-button"><i data-lucide="x"></i></button>
+          </div>
+          <video id="videoPlayer" controls preload="metadata"></video>
+          <div id="playerMeta" class="player-meta"></div>
+        </div>
       </section>
     </main>
   </div>
 
-  <div class="modal-backdrop hidden" id="settingsOverlay" role="presentation">
-    <section class="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
-      <header class="settings-header">
-        <h2 id="settingsTitle">设置</h2>
-        <button class="close-button" id="closeSettingsButton" type="button" aria-label="关闭设置"><i data-lucide="x" class="lucide-icon icon-19" aria-hidden="true"></i></button>
-      </header>
-      <div class="settings-body">
-        <div class="settings-grid">
-          <label class="field-group">
-            <span>转写语言</span>
-            <select id="languageSelect">
-              <option value="auto">自动识别（仅转写）</option>
-              <option value="zh">中文（普通话）</option>
-              <option value="en">English</option>
-              <option value="ja">日本語</option>
-              <option value="ko">한국어</option>
-            </select>
-          </label>
-          <label class="field-group">
-            <span>计算设备</span>
-            <select id="deviceSelect">
-              <option value="auto">自动（GPU 优先）</option>
-              <option value="cuda">NVIDIA CUDA</option>
-              <option value="cpu">仅使用 CPU</option>
-            </select>
-          </label>
-        </div>
-
-        <section class="settings-row correction-setting">
-          <div>
-            <strong>智能校订</strong>
-            <small>使用 DeepSeek 修复明显的上下文错误</small>
-          </div>
-          <label class="switch">
-            <input id="llmRepair" type="checkbox">
-            <span></span>
-          </label>
-        </section>
-
-        <section class="deepseek-panel hidden" id="llmKeyPanel">
-          <label class="field-group">
-            <span>DeepSeek API Key</span>
-            <input id="deepseekApiKey" type="password" autocomplete="off" placeholder="sk-...">
-          </label>
-          <p>密钥仅传给本次转写进程，不写入历史记录。</p>
-        </section>
-
-        <section class="destination-section">
-          <h3>默认保存位置</h3>
-          <label class="radio-row">
-            <input type="radio" name="outputMode" value="source" checked>
-            <span>保存在源文件旁</span>
-          </label>
-          <label class="radio-row">
-            <input type="radio" name="outputMode" value="custom">
-            <span>自定义文件夹</span>
-          </label>
-          <div class="path-control hidden" id="pathControl">
-            <input id="outputPath" type="text" readonly placeholder="请选择保存文件夹">
-            <button class="secondary-button compact" id="chooseOutputButton" type="button">选择文件夹</button>
-          </div>
-        </section>
-
-        <details class="diagnostics">
-          <summary>诊断日志</summary>
-          <div class="diagnostic-meta"><span id="modelStatus">模型待加载</span><span id="logHint">暂无日志</span></div>
-          <pre id="logOutput">等待开始转写…</pre>
-        </details>
+  <div id="settingsModal" class="modal-backdrop hidden">
+    <div class="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+      <div class="modal-head">
+        <div><span class="eyebrow">设置</span><h2 id="settingsTitle">连接与转录</h2></div>
+        <button id="closeSettingsButton" class="icon-button"><i data-lucide="x"></i></button>
       </div>
-      <footer class="settings-footer">
-        <button class="primary-button compact-primary" id="saveSettingsButton" type="button">保存设置</button>
-      </footer>
-    </section>
+      <div class="settings-content">
+        <section class="settings-section">
+          <div class="settings-section-title"><span>AI 服务</span><em id="aiVerifiedBadge">未验证</em></div>
+          <p>用于判断专业词汇、可信校对和基于证据生成回答。支持 OpenAI 兼容接口。</p>
+          <label>Base URL<input id="aiBaseUrl" type="url" placeholder="https://api.openai.com/v1"></label>
+          <div class="form-grid two">
+            <label>模型<input id="aiModel" type="text" placeholder="gpt-5-mini"></label>
+            <label>上下文窗口<input id="aiContextWindow" type="number" min="4096" step="1024" value="128000"></label>
+          </div>
+          <label>API Key
+            <div class="secret-field"><input id="aiApiKey" type="password" autocomplete="off" placeholder="留空表示沿用已保存的密钥"><button id="toggleApiKey" type="button"><i data-lucide="eye"></i></button></div>
+          </label>
+          <button id="testAiButton" class="button primary full"><i data-lucide="plug-zap"></i>测试连接并保存</button>
+          <div id="aiTestResult" class="inline-result hidden"></div>
+        </section>
+
+        <section class="settings-section">
+          <div class="settings-section-title"><span>本地转录</span></div>
+          <div class="form-grid two">
+            <label>转录模型<select id="runtimeModel"><option value="medium">Medium</option><option value="large-v3-turbo">Large-v3 Turbo</option></select></label>
+            <label>运行设备<select id="runtimeDevice"><option value="auto">自动选择</option><option value="cuda">NVIDIA 显卡</option><option value="cpu">CPU</option></select></label>
+            <label>视频语言<select id="runtimeLanguage"><option value="auto">自动识别</option><option value="zh">中文</option><option value="en">英文</option><option value="ja">日语</option></select></label>
+            <label>临时文件<select id="tempPolicy"><option value="manual">验收后手动清理</option></select></label>
+          </div>
+          <button id="saveRuntimeButton" class="button full">保存本地设置</button>
+        </section>
+      </div>
+    </div>
   </div>
 
-  <input id="modelSelect" type="hidden" value="medium">
-  <input id="contextMode" type="hidden" value="isolated">
-  <input id="skipExisting" type="checkbox" checked hidden>
-  <input id="autoStartFolder" type="checkbox" hidden>
-  <textarea id="promptInput" hidden></textarea>
+  <div id="spacePrompt" class="modal-backdrop hidden">
+    <div class="modal small-modal">
+      <div class="small-modal-icon"><i data-lucide="folder-plus"></i></div>
+      <h2>先选择一个知识空间</h2>
+      <p>这里会保存视频副本、Obsidian 知识库和检索索引。整个文件夹以后可以自由移动。</p>
+      <button id="chooseSpacePromptButton" class="button primary full">选择目录</button>
+      <button id="cancelSpacePromptButton" class="text-button centered">暂时取消</button>
+    </div>
+  </div>
 
-  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+  <div id="toastStack" class="toast-stack"></div>
+
   <script src="vendor/lucide.min.js"></script>
   <script src="app.js"></script>
 </body>

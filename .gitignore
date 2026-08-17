@@ -10,6 +10,24 @@ last_run.log
 *.log
 config.json
 history.json
+model-providers.json
+model-providers.local.json
+.env
+.env.*
+# Machine-specific batch recovery and account handoff notes
+resume_knowledge_batch.ps1
+docs/CODEX_ACCOUNT_HANDOFF.md
+# Knowledge spaces are user-owned output, never source artifacts
+.work/
+.knowledge/
+knowledge-index.jsonl
+Obsidian知识库/
+视频/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
 
 # Models and GPU runtime are installed locally
 models/

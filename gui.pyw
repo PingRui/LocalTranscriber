@@ -1,56 +1,109 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import subprocess
 import sys
 import threading
-import ctypes
-import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import webview
 
-from app_config import MODEL_LABELS, SUPPORTED_MODELS, load_config, state_dir
+from app_config import MODEL_LABELS, SUPPORTED_MODELS, load_config, save_config, state_dir
+from knowledge_space import (
+    MEDIA_EXTENSIONS,
+    OBSIDIAN_FOLDER,
+    WORK_FOLDER,
+    answer_question,
+    clean_task_work,
+    create_task,
+    discover_videos,
+    initialize_space,
+    load_index,
+    load_latest_resumable_task,
+    reconcile_space_metadata,
+    relink_video,
+    space_paths,
+    write_task,
+)
+from knowledge_pipeline import prepare_manual_confirmation, run_resumable_task
+from llm_client import OpenAICompatibleClient, normalize_openai_base_url
+from model_provider_config import load_provider_settings, save_provider_settings
 
 
 APP_DIR = Path(__file__).resolve().parent
-PYTHON = Path(sys.executable).resolve()
+EXECUTABLE = Path(sys.executable).resolve()
+PYTHON = EXECUTABLE.with_name("python.exe") if EXECUTABLE.name.casefold() == "pythonw.exe" else EXECUTABLE
 TRANSCRIBER = APP_DIR / "transcribe.py"
+KNOWLEDGE_WORKER = APP_DIR / "knowledge_worker.py"
+WHOLE_FILE_REVIEW = APP_DIR / "whole_file_review.py"
 UI_FILE = APP_DIR / "ui" / "index.html"
 ICON_FILE = APP_DIR / "assets" / "localtranscriber-icon.ico"
-APP_CONFIG = load_config()
 STATE_DIR = state_dir()
+APP_SETTINGS_FILE = STATE_DIR / "knowledge-app.json"
+MODEL_PROVIDER_SETTINGS_FILE = STATE_DIR / "model-providers.json"
 LOG_FILE = STATE_DIR / "last_run.log"
-HISTORY_FILE = STATE_DIR / "history.json"
 EVENT_PREFIX = "@@LOCAL_TRANSCRIBER_EVENT@@"
-MEDIA_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".mp3", ".wav", ".m4a", ".aac", ".flac", ".webm"}
 MEDIA_DIALOG_TYPES = (
-    "视频和音频 (*.mp4;*.mov;*.mkv;*.avi;*.mp3;*.wav;*.m4a;*.aac;*.flac;*.webm)",
+    "视频和音频 (*.mp4;*.mov;*.mkv;*.avi;*.webm;*.mp3;*.wav;*.m4a;*.aac;*.flac)",
     "所有文件 (*.*)",
 )
-ALLOWED_LANGUAGES = {"auto", "zh", "en", "ja", "ko"}
-ALLOWED_DEVICES = {"auto", "cuda", "cpu"}
-ALLOWED_MODELS = set(SUPPORTED_MODELS)
-ALLOWED_CONTEXT_MODES = {"continuous", "isolated"}
+STAGES = (
+    ("copy", "复制视频"),
+    ("analyze", "分析样本"),
+    ("confirm", "确认专业词汇"),
+    ("transcribe", "全文转录"),
+    ("verify", "可信校对"),
+    ("publish", "生成知识"),
+    ("write", "写入知识空间"),
+)
+INSTANCE_MUTEX_NAME = "Local\\LocalTranscriber.Knowledge"
+_INSTANCE_MUTEX_HANDLE: int | None = None
+
+
+def iso_now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def configure_app_identity() -> None:
-    """Give the Windows taskbar a stable identity separate from pythonw.exe."""
+    if sys.platform == "win32":
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("LocalTranscriber.Knowledge")
+
+
+def acquire_single_instance(name: str = INSTANCE_MUTEX_NAME) -> bool:
+    global _INSTANCE_MUTEX_HANDLE
     if sys.platform != "win32":
-        return
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-        "LocalTranscriber.Desktop"
-    )
+        return True
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateMutexW.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.CreateMutexW(None, False, name)
+    if not handle:
+        return True
+    if kernel32.GetLastError() == 183:
+        kernel32.CloseHandle(handle)
+        return False
+    _INSTANCE_MUTEX_HANDLE = int(handle)
+    return True
+
+
+def release_single_instance() -> None:
+    global _INSTANCE_MUTEX_HANDLE
+    handle = _INSTANCE_MUTEX_HANDLE
+    _INSTANCE_MUTEX_HANDLE = None
+    if sys.platform == "win32" and handle:
+        ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(handle))
 
 
 def set_process_suspended(pid: int, suspended: bool) -> bool:
-    """Suspend or resume the transcription worker on Windows."""
     if sys.platform != "win32":
         return False
-
     process_suspend_resume = 0x0800
     kernel32 = ctypes.windll.kernel32
     ntdll = ctypes.windll.ntdll
@@ -58,7 +111,6 @@ def set_process_suspended(pid: int, suspended: bool) -> bool:
     kernel32.OpenProcess.restype = ctypes.c_void_p
     kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
     kernel32.CloseHandle.restype = ctypes.c_int
-
     handle = kernel32.OpenProcess(process_suspend_resume, False, pid)
     if not handle:
         return False
@@ -71,857 +123,750 @@ def set_process_suspended(pid: int, suspended: bool) -> bool:
         kernel32.CloseHandle(handle)
 
 
-def path_key(value: str | Path) -> str:
-    return os.path.normcase(str(Path(value).expanduser().resolve()))
-
-
-def format_file_size(size: int) -> str:
-    value = float(max(size, 0))
+def format_size(size: int) -> str:
+    value = float(max(0, size))
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if value < 1024 or unit == "TB":
-            digits = 0 if unit == "B" else 1
-            return f"{value:.{digits}f} {unit}"
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
         value /= 1024
-    return f"{size} B"
+    return str(size)
 
 
-def iso_now() -> str:
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+def read_json(path: Path, fallback: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+        return fallback
 
 
-class TranscriberApi:
+def write_json(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
+
+
+class KnowledgeApi:
     def __init__(self, initial_files: tuple[str, ...] = ()) -> None:
         self.window: webview.Window | None = None
         self.lock = threading.RLock()
-        self.files: list[dict[str, Any]] = []
-        self.result_dirs: dict[str, Path] = {}
-        self.log_lines: list[str] = []
-        self.process: subprocess.Popen[str] | None = None
+        self.app_config = load_config()
+        saved = read_json(APP_SETTINGS_FILE, {})
+        self.space_root = ""
+        self._preferred_space_root = str(saved.get("space_root") or "")
+        self._knowledge_count = 0
+        self._index_mtime_ns: int | None = None
+        self._integrity_status = "idle"
+        self.language = str(saved.get("language") or "auto")
+        self.temp_policy = "manual"
+        self.recent_spaces = [str(item) for item in saved.get("recent_spaces", []) if str(item).strip()][:12]
+        provider = load_provider_settings(MODEL_PROVIDER_SETTINGS_FILE).get("corrector", {})
+        self.api_base_url = str(provider.get("base_url") or "")
+        self.api_model = str(provider.get("model") or "")
+        self.api_key = str(provider.get("api_key") or "")
+        self.api_verified_at = str(provider.get("verified_at") or "")
+        self.context_window = int(provider.get("context_window") or 128_000)
+        self.queue: list[dict[str, Any]] = []
+        self.task: dict[str, Any] | None = None
         self.running = False
         self.paused = False
-        self.scanning = False
         self.cancel_requested = False
-        self.status_before_pause = ""
-        self.status_text = "请添加需要转写的文件"
-        self.progress = 0.0
-        self.model_status = "模型待加载"
-        self.model_loading = False
-        self.output_path = ""
-        self.default_model = str(APP_CONFIG["default_model"])
-        self.default_device = str(APP_CONFIG["default_device"])
-        self.hf_cache_dir = str(APP_CONFIG["hf_cache_dir"])
-        self.history: dict[str, dict[str, Any]] = self.load_history()
-        self.source_map_file: Path | None = None
-        self.batch_summary = {"total": 0, "completed": 0, "failed": 0, "skipped": 0}
-        self.add_paths(initial_files)
+        self.process: subprocess.Popen[str] | None = None
+        self.activities: list[dict[str, str]] = []
+        self.messages: list[dict[str, Any]] = []
+        self.chat_running = False
+        self._last_notify = 0.0
+        if initial_files:
+            self._add_discovered(discover_videos(initial_files))
 
     def attach_window(self, window: webview.Window) -> None:
         self.window = window
 
-    def file_record(self, value: str | Path) -> dict[str, Any]:
-        path = Path(value).expanduser().resolve()
-        try:
-            size_label = format_file_size(path.stat().st_size)
-        except OSError:
-            size_label = ""
-        return {
-            "path": str(path),
-            "name": path.name,
-            "folder": str(path.parent),
-            "size_label": size_label,
-            "media_type": "audio" if path.suffix.lower() in {".mp3", ".wav", ".m4a", ".aac", ".flac"} else "video",
-            "status": "等待中",
-            "progress": 0.0,
-        }
-
-    def load_history(self) -> dict[str, dict[str, Any]]:
-        try:
-            payload = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, TypeError):
-            return {}
-        records = payload.get("items", []) if isinstance(payload, dict) else []
-        history: dict[str, dict[str, Any]] = {}
-        for record in records:
-            if not isinstance(record, dict) or not record.get("path"):
-                continue
-            try:
-                history[path_key(str(record["path"]))] = dict(record)
-            except OSError:
-                continue
-        return history
-
-    def save_history(self) -> None:
-        try:
-            STATE_DIR.mkdir(parents=True, exist_ok=True)
-            items = sorted(
-                self.history.values(),
-                key=lambda item: str(item.get("updated_at", item.get("created_at", ""))),
-                reverse=True,
-            )[:500]
-            HISTORY_FILE.write_text(
-                json.dumps({"items": items}, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-        except OSError:
-            pass
-
-    def history_items(self) -> list[dict[str, Any]]:
-        return sorted(
-            (dict(item) for item in self.history.values()),
-            key=lambda item: str(item.get("updated_at", item.get("created_at", ""))),
-            reverse=True,
+    def save_app_settings(self) -> None:
+        write_json(
+            APP_SETTINGS_FILE,
+            {
+                "version": 2,
+                "space_root": self.space_root or self._preferred_space_root,
+                "recent_spaces": self.recent_spaces,
+                "language": self.language,
+                "temp_policy": self.temp_policy,
+            },
         )
 
-    def sync_history(
-        self,
-        item: dict[str, Any],
-        *,
-        output_dir: str | Path | None = None,
-        outputs: list[str] | None = None,
-        persist: bool = False,
-    ) -> None:
-        key = path_key(item["path"])
-        previous = self.history.get(key, {})
-        record = {
-            **previous,
-            "path": item["path"],
-            "name": item["name"],
-            "folder": item["folder"],
-            "size_label": item.get("size_label", ""),
-            "media_type": item.get("media_type", "video"),
-            "status": item.get("status", "等待中"),
-            "progress": float(item.get("progress", 0.0)),
-            "created_at": previous.get("created_at") or iso_now(),
-            "updated_at": iso_now(),
-        }
-        if output_dir:
-            record["result_dir"] = str(Path(output_dir).expanduser().resolve())
-        if outputs is not None:
-            record["outputs"] = [str(Path(value).expanduser().resolve()) for value in outputs]
-        self.history[key] = record
-        if persist:
-            self.save_history()
+    def api_ready(self) -> bool:
+        return bool(self.api_base_url and self.api_model and self.api_key and self.api_verified_at)
 
-    def add_paths(self, paths: tuple[str, ...] | list[str]) -> int:
-        added = 0
-        with self.lock:
-            known = {path_key(item["path"]) for item in self.files}
-            for value in paths:
-                path = Path(value).expanduser().resolve()
-                key = path_key(path)
-                if not path.is_file() or path.suffix.lower() not in MEDIA_EXTENSIONS or key in known:
-                    continue
-                self.files.append(self.file_record(path))
-                known.add(key)
-                added += 1
-            if added:
-                self.status_text = f"已添加 {len(self.files)} 个文件，可以开始转写"
-        return added
+    def _space_summary(self) -> dict[str, Any]:
+        if not self.space_root:
+            return {"ready": False, "root": "", "name": "", "knowledge_count": 0}
+        root = Path(self.space_root)
+        return {
+            "ready": True,
+            "root": str(root),
+            "name": root.name,
+            "knowledge_count": self._knowledge_count,
+            "obsidian": str(root / OBSIDIAN_FOLDER),
+            "integrity": self._integrity_status,
+        }
+
+    def _remember_index_state(self, root: Path, knowledge_count: int) -> None:
+        self._knowledge_count = max(0, int(knowledge_count))
+        try:
+            self._index_mtime_ns = space_paths(root)["index"].stat().st_mtime_ns
+        except OSError:
+            self._index_mtime_ns = None
+
+    def _refresh_index_state(self) -> None:
+        if not self.space_root:
+            return
+        root = Path(self.space_root)
+        index_path = space_paths(root)["index"]
+        try:
+            current_mtime_ns = index_path.stat().st_mtime_ns
+            if self._index_mtime_ns == current_mtime_ns:
+                return
+            knowledge_count = len(load_index(root))
+        except (OSError, UnicodeError, ValueError):
+            return
+        self._knowledge_count = knowledge_count
+        self._index_mtime_ns = current_mtime_ns
+
+    def _check_space_integrity(self, root: Path, entries: list[dict[str, Any]]) -> None:
+        try:
+            result = reconcile_space_metadata(root, entries)
+        except (OSError, UnicodeError, ValueError):
+            result = {"ok": False, "migration_required": False, "projection_stale": True}
+        if self.space_root != str(root):
+            return
+        if result.get("migration_required"):
+            self._integrity_status = "migration_pending"
+            self.activity("检测到旧版知识数据；将在下次知识写入或显式修复时迁移", "warning")
+        elif result.get("projection_stale"):
+            self._integrity_status = "projection_stale"
+            self.activity("知识索引可用，Obsidian 投影需要按需更新", "warning")
+        else:
+            self._integrity_status = "ready"
+        self.notify("space_integrity", force=True)
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
+            task = json.loads(json.dumps(self.task, ensure_ascii=False)) if self.task else None
             return {
-                "files": [dict(item) for item in self.files],
-                "history": self.history_items(),
+                "space": self._space_summary(),
+                "recent_spaces": list(self.recent_spaces),
+                "queue": [dict(item, size=format_size(int(item.get("size_bytes", 0)))) for item in self.queue],
+                "task": task,
                 "running": self.running,
                 "paused": self.paused,
-                "scanning": self.scanning,
-                "task_mode": "single" if len(self.files) == 1 else "batch",
-                "status_text": self.status_text,
-                "progress": self.progress,
-                "logs": list(self.log_lines[-300:]),
-                "result_dirs": {item["path"]: str(self.result_dirs[key]) for item in self.files if (key := path_key(item["path"])) in self.result_dirs},
-                "model_status": self.model_status,
-                "model_loading": self.model_loading,
-                "default_model": self.default_model,
-                "default_device": self.default_device,
-                "output_path": self.output_path,
-                "batch_summary": dict(self.batch_summary),
+                "activities": list(self.activities[-80:]),
+                "ai": {
+                    "base_url": self.api_base_url,
+                    "model": self.api_model,
+                    "has_key": bool(self.api_key),
+                    "verified": self.api_ready(),
+                    "verified_at": self.api_verified_at,
+                    "context_window": self.context_window,
+                },
+                "runtime": {
+                    "model": str(self.app_config.get("default_model") or "medium"),
+                    "model_options": [
+                        {"value": name, "label": MODEL_LABELS.get(name, name)} for name in SUPPORTED_MODELS
+                    ],
+                    "device": str(self.app_config.get("default_device") or "auto"),
+                    "language": self.language,
+                    "temp_policy": self.temp_policy,
+                },
+                "chat": {"running": self.chat_running, "messages": list(self.messages)},
             }
 
-    def response(self, ok: bool = True, **payload: Any) -> dict[str, Any]:
-        return {"ok": ok, "snapshot": self.snapshot(), **payload}
+    def response(self, ok: bool = True, message: str | None = None, error: str | None = None, **extra: Any) -> dict[str, Any]:
+        return {"ok": ok, "message": message, "error": error, "snapshot": self.snapshot(), **extra}
 
-    def notify(self, event_type: str, message: str | None = None, level: str = "info", **payload: Any) -> None:
+    def notify(self, event_type: str, message: str | None = None, level: str = "info", force: bool = False) -> None:
+        if event_type in {"video_done", "task_done"}:
+            self._refresh_index_state()
         window = self.window
         if window is None:
             return
-        event = {
+        now = time.monotonic()
+        if not force and event_type.endswith("_progress") and now - self._last_notify < 0.12:
+            return
+        self._last_notify = now
+        payload = {
             "type": event_type,
             "message": message,
             "level": level,
             "snapshot": self.snapshot(),
-            **payload,
         }
         try:
-            window.evaluate_js(f"window.LocalTranscriber && window.LocalTranscriber.receive({json.dumps(event, ensure_ascii=False)})")
+            window.evaluate_js(
+                f"window.LocalTranscriber && window.LocalTranscriber.receive({json.dumps(payload, ensure_ascii=False)})"
+            )
         except Exception:
-            # The window can disappear while a worker is completing.
             pass
+
+    def activity(self, text: str, level: str = "info") -> None:
+        with self.lock:
+            self.activities.append({"time": datetime.now().strftime("%H:%M:%S"), "text": text, "level": level})
+            self.activities = self.activities[-100:]
 
     def bootstrap(self) -> dict[str, Any]:
         return self.response()
 
-    def choose_files(self) -> dict[str, Any]:
-        if self.running or self.scanning or self.window is None:
-            return self.response(False, error="当前任务进行中，暂时不能添加文件。")
-        paths = self.window.create_file_dialog(
+    def open_folder_dialog(self, initial: str = "") -> Any:
+        if self.window is None:
+            return None
+        options: dict[str, str] = {}
+        candidate = str(initial or "").strip()
+        if candidate:
+            try:
+                path = Path(candidate).expanduser()
+                if path.is_dir():
+                    options["directory"] = str(path.resolve())
+            except (OSError, TypeError, ValueError):
+                pass
+        try:
+            return self.window.create_file_dialog(webview.FileDialog.FOLDER, **options)
+        except (OSError, TypeError, ValueError):
+            if options:
+                return self.window.create_file_dialog(webview.FileDialog.FOLDER)
+            raise
+
+    def choose_space(self) -> dict[str, Any]:
+        if self.running:
+            return self.response(False, error="任务进行中，暂时不能切换知识空间。")
+        if self.chat_running:
+            return self.response(False, error="上一条问答仍在处理中，暂时不能切换知识空间。")
+        try:
+            selected = self.open_folder_dialog(self.space_root or self._preferred_space_root)
+        except (OSError, TypeError, ValueError) as exc:
+            return self.response(False, error=f"无法打开文件夹选择窗口：{exc}")
+        if not selected:
+            return self.response()
+        return self.open_space(str(selected[0]))
+
+    def open_space(self, path: str) -> dict[str, Any]:
+        if self.running:
+            return self.response(False, error="任务进行中，暂时不能切换知识空间。")
+        if self.chat_running:
+            return self.response(False, error="上一条问答仍在处理中，暂时不能切换知识空间。")
+        try:
+            root = Path(path).expanduser().resolve()
+            initialize_space(root)
+            entries = load_index(root)
+            knowledge_count = len(entries)
+            task = load_latest_resumable_task(root)
+        except (OSError, UnicodeError, ValueError) as exc:
+            return self.response(False, error=f"无法打开知识空间：{exc}")
+        with self.lock:
+            self.space_root = str(root)
+            self._preferred_space_root = str(root)
+            self._remember_index_state(root, knowledge_count)
+            self._integrity_status = "checking"
+            self.recent_spaces = [str(root), *[item for item in self.recent_spaces if os.path.normcase(item) != os.path.normcase(str(root))]][:12]
+            self.queue.clear()
+            self.messages.clear()
+            self.task = task
+            self.save_app_settings()
+        if self.window is not None:
+            threading.Thread(target=self._check_space_integrity, args=(root, entries), daemon=True).start()
+        message = f"已打开知识空间：{root.name}"
+        if self.task:
+            message += "，发现可继续的任务"
+        return self.response(message=message)
+
+    def remove_recent_space(self, path: str) -> dict[str, Any]:
+        target = str(path or "").strip()
+        if not target:
+            return self.response(False, error="最近知识空间路径无效。")
+        try:
+            target_key = os.path.normcase(str(Path(target).expanduser().resolve()))
+        except (OSError, TypeError, ValueError):
+            target_key = os.path.normcase(target)
+        remaining = []
+        removed = False
+        for item in self.recent_spaces:
+            try:
+                item_key = os.path.normcase(str(Path(item).expanduser().resolve()))
+            except (OSError, TypeError, ValueError):
+                item_key = os.path.normcase(item)
+            if item_key == target_key:
+                removed = True
+            else:
+                remaining.append(item)
+        if not removed:
+            return self.response(message="该目录已不在最近列表中")
+        self.recent_spaces = remaining
+        self.save_app_settings()
+        return self.response(message="已从最近列表移除；磁盘文件未删除")
+
+    def choose_videos(self) -> dict[str, Any]:
+        if self.window is None:
+            return self.response(False, error="桌面窗口尚未就绪，暂时不能添加视频。")
+        with self.lock:
+            if self.running and not self.paused:
+                return self.response(False, error="请先暂停当前任务，再追加视频。")
+            active_task_id = str(self.task.get("task_id") or "") if self.running and self.paused and self.task else ""
+        selected = self.window.create_file_dialog(
             webview.FileDialog.OPEN,
             allow_multiple=True,
             file_types=MEDIA_DIALOG_TYPES,
         )
-        if not paths:
-            return self.response()
-        added = self.add_paths(list(paths))
-        message = f"已添加 {added} 个文件" if added else "没有新增支持的媒体文件"
-        return self.response(message=message)
-
-    def add_files(self, paths: list[str]) -> dict[str, Any]:
-        if self.running or self.scanning:
-            return self.response(False, error="当前任务进行中，暂时不能添加文件。")
-        added = self.add_paths(paths)
-        message = f"已添加 {added} 个文件" if added else "没有新增支持的媒体文件"
-        return self.response(message=message)
-
-    def choose_folder(self, auto_start: bool = False, settings: dict[str, Any] | None = None) -> dict[str, Any]:
-        if self.running or self.scanning or self.window is None:
-            return self.response(False, error="当前任务进行中，暂时不能扫描文件夹。")
-        selected = self.window.create_file_dialog(webview.FileDialog.FOLDER)
         if not selected:
             return self.response()
-        folder = str(selected[0])
+        added = self._add_discovered(discover_videos(selected), active_task_id=active_task_id)
+        if not added:
+            return self.response(message="没有新增视频，重复文件已自动跳过")
+        message = f"已追加 {added} 个视频到当前任务末尾" if active_task_id else f"已添加 {added} 个视频"
+        return self.response(message=message)
+
+    def choose_video_folder(self) -> dict[str, Any]:
         with self.lock:
-            self.scanning = True
-            self.progress = 0.0
-            self.status_text = f"正在扫描全部子文件夹：{folder}"
-        threading.Thread(
-            target=self.scan_folder,
-            args=(folder, bool(auto_start), dict(settings or {})),
-            daemon=True,
-        ).start()
-        return self.response(message="已开始扫描文件夹")
-
-    def scan_folder(self, folder: str, auto_start: bool, settings: dict[str, Any]) -> None:
-        found: list[str] = []
-        errors: list[str] = []
-
-        def record_error(error: OSError) -> None:
-            errors.append(str(error))
-
+            if self.running and not self.paused:
+                return self.response(False, error="请先暂停当前任务，再追加文件夹。")
+            active_task_id = str(self.task.get("task_id") or "") if self.running and self.paused and self.task else ""
         try:
-            next_report = 100
-            for directory, _subdirs, filenames in os.walk(folder, onerror=record_error, followlinks=False):
-                for filename in filenames:
-                    if Path(filename).suffix.lower() in MEDIA_EXTENSIONS:
-                        found.append(str(Path(directory, filename).resolve()))
-                if len(found) >= next_report:
-                    with self.lock:
-                        self.status_text = f"正在扫描全部子文件夹：已发现 {len(found)} 个媒体文件"
-                    self.notify("scan_progress")
-                    next_report += 100
-            found.sort(key=str.casefold)
-            before = len(self.files)
-            self.add_paths(found)
-            added = len(self.files) - before
-            with self.lock:
-                self.scanning = False
-                self.status_text = (
-                    f"扫描完成：发现 {len(found)} 个媒体文件，新加入 {added} 个"
-                    if found
-                    else "扫描完成，没有找到支持的视频或音频"
+            selected = self.open_folder_dialog()
+        except (OSError, TypeError, ValueError) as exc:
+            return self.response(False, error=f"无法打开文件夹选择窗口：{exc}")
+        if not selected:
+            return self.response()
+        discovered = discover_videos([selected[0]])
+        added = self._add_discovered(discovered, active_task_id=active_task_id)
+        duplicates = len(discovered) - added
+        action = "追加到当前任务" if active_task_id else "新增"
+        return self.response(
+            message=f"递归发现 {len(discovered)} 个视频，{action} {added} 个" + (f"，跳过 {duplicates} 个重复项" if duplicates else "")
+        )
+
+    def _add_discovered(self, values: list[dict[str, Any]], active_task_id: str = "") -> int:
+        with self.lock:
+            task = self.task if self.task and str(self.task.get("task_id") or "") == active_task_id else None
+            existing = {os.path.normcase(str(item["source"])) for item in self.queue}
+            if task:
+                existing.update(os.path.normcase(str(item.get("source") or "")) for item in task.get("videos", []))
+            added_items: list[dict[str, Any]] = []
+            for item in values:
+                key = os.path.normcase(str(item["source"]))
+                if key in existing:
+                    continue
+                normalized = dict(item)
+                self.queue.append(normalized)
+                added_items.append(normalized)
+                existing.add(key)
+            added = len(added_items)
+            if task and added_items:
+                task.setdefault("videos", []).extend(
+                    {
+                        **item,
+                        "status": "waiting",
+                        "stage": "copy",
+                        "progress": 0.0,
+                        "message": "运行中追加，等待开始",
+                    }
+                    for item in added_items
                 )
-                for error in errors[:10]:
-                    self.append_log(error, notify=False)
-            self.notify(
-                "scan_done",
-                message=(f"扫描完成，新加入 {added} 个文件" if found else "没有找到支持的媒体文件"),
-            )
-            if found and auto_start:
-                self.start_transcription(settings)
-        except Exception as exc:
-            with self.lock:
-                self.scanning = False
-                self.status_text = "文件夹扫描失败"
-            self.notify("scan_error", f"扫描失败：{type(exc).__name__}: {exc}", "error")
+                task.pop("completed_at", None)
+                self._update_overall()
+                self.activity(f"暂停时追加 {added} 个视频，已保存到当前任务末尾")
+                self._persist_task()
+        return added
 
-    def remove_files(self, paths: list[str]) -> dict[str, Any]:
-        if self.running or self.scanning:
-            return self.response(False, error="当前任务进行中，不能修改队列。")
-        keys = {path_key(item) for item in paths}
-        with self.lock:
-            before = len(self.files)
-            self.files = [item for item in self.files if path_key(item["path"]) not in keys]
-            for key in keys:
-                self.result_dirs.pop(key, None)
-            removed = before - len(self.files)
-            if not self.files:
-                self.status_text = "请添加需要转写的文件"
-        return self.response(message=f"已移除 {removed} 个文件" if removed else None)
+    def remove_video(self, source: str) -> dict[str, Any]:
+        if self.running:
+            return self.response(False, error="任务进行中，不能修改队列。")
+        key = os.path.normcase(str(Path(source).expanduser().resolve()))
+        before = len(self.queue)
+        self.queue = [item for item in self.queue if os.path.normcase(str(item["source"])) != key]
+        return self.response(message="已从待处理列表移除" if len(self.queue) < before else None)
 
-    def clear_files(self) -> dict[str, Any]:
-        if self.running or self.scanning:
-            return self.response(False, error="当前任务进行中，不能清空队列。")
-        with self.lock:
-            self.files.clear()
-            self.result_dirs.clear()
-            self.progress = 0.0
-            self.status_text = "请添加需要转写的文件"
+    def clear_queue(self) -> dict[str, Any]:
+        if self.running:
+            return self.response(False, error="任务进行中，不能清空队列。")
+        self.queue.clear()
         return self.response()
 
-    def choose_output(self) -> dict[str, Any]:
-        if self.running or self.scanning or self.window is None:
-            return self.response(False, error="当前任务进行中，不能修改输出位置。")
-        selected = self.window.create_file_dialog(webview.FileDialog.FOLDER, directory=self.output_path)
-        if not selected:
-            return self.response(path=self.output_path)
-        with self.lock:
-            self.output_path = str(Path(selected[0]).expanduser().resolve())
-        return self.response(path=self.output_path)
-
-    def normalize_settings(self, settings: dict[str, Any]) -> dict[str, Any]:
-        language = str(settings.get("language", "auto")).lower()
-        device = str(settings.get("device", self.default_device)).lower()
-        output_mode = str(settings.get("output_mode", "source")).lower()
-        output_path = str(settings.get("output_path", "")).strip()
-        prompt = str(settings.get("prompt", "")).strip()
-        source_url = str(settings.get("source_url", "")).strip()
-        raw_source_urls = settings.get("source_urls", {})
-        source_urls: dict[str, str] = {}
-        if isinstance(raw_source_urls, dict):
-            known_paths = {path_key(item["path"]): item["path"] for item in self.files}
-            for raw_path, raw_url in raw_source_urls.items():
-                try:
-                    key = path_key(str(raw_path))
-                except OSError:
-                    continue
-                url = str(raw_url).strip()
-                if key in known_paths and url:
-                    source_urls[known_paths[key]] = url
-        if source_url and len(self.files) == 1:
-            source_urls[self.files[0]["path"]] = source_url
-        context_mode = str(settings.get("context_mode", "isolated")).lower()
-        llm_repair = bool(settings.get("llm_repair", False))
-        deepseek_api_key = str(settings.get("deepseek_api_key", "")).strip()
-        model = str(settings.get("model", self.default_model)).lower()
-        return {
-            "model": model if model in ALLOWED_MODELS else self.default_model,
-            "language": language if language in ALLOWED_LANGUAGES else "auto",
-            "device": device if device in ALLOWED_DEVICES else "auto",
-            "output_mode": output_mode if output_mode in {"source", "custom"} else "source",
-            "output_path": output_path,
-            "prompt": prompt,
-            "source_url": source_url,
-            "source_urls": source_urls,
-            "context_mode": context_mode if context_mode in ALLOWED_CONTEXT_MODES else "isolated",
-            "llm_repair": llm_repair,
-            "deepseek_api_key": deepseek_api_key,
-            "skip_existing": bool(settings.get("skip_existing", True)),
+    def test_and_save_ai(self, base_url: str, model: str, api_key: str, context_window: Any) -> dict[str, Any]:
+        key = str(api_key or "").strip() or self.api_key
+        try:
+            window = max(8_000, int(context_window))
+            client = OpenAICompatibleClient(
+                base_url=normalize_openai_base_url(base_url),
+                model=str(model).strip(),
+                api_key=key,
+                allow_remote=True,
+                timeout=90,
+            )
+            client.test_chat_completion()
+        except (OSError, ValueError, RuntimeError, TypeError) as exc:
+            self.api_verified_at = ""
+            return self.response(False, error=f"连接测试失败：{exc}")
+        verified_at = iso_now()
+        payload = {
+            "provider": "openai",
+            "base_url": client.base_url,
+            "model": client.model,
+            "api_key": key,
+            "verified_at": verified_at,
+            "context_window": window,
         }
+        save_provider_settings(MODEL_PROVIDER_SETTINGS_FILE, {"corrector": payload, "verifier": payload})
+        self.api_base_url = client.base_url
+        self.api_model = client.model
+        self.api_key = key
+        self.api_verified_at = verified_at
+        self.context_window = window
+        return self.response(message="OpenAI 兼容接口已连接并保存")
 
-    def start_transcription(self, raw_settings: dict[str, Any]) -> dict[str, Any]:
-        if self.running or self.scanning:
-            return self.response(False, error="已有任务正在运行。")
-        if not self.files:
-            return self.response(False, error="请先添加一个或多个视频、音频文件。")
+    def save_runtime_settings(self, model: str, device: str, language: str, temp_policy: str) -> dict[str, Any]:
+        if model not in SUPPORTED_MODELS:
+            return self.response(False, error="转写模型无效")
+        if device not in {"auto", "cuda", "cpu"}:
+            return self.response(False, error="计算设备无效")
+        if language not in {"auto", "zh", "en", "ja", "ko"}:
+            return self.response(False, error="转写语言无效")
+        if temp_policy != "manual":
+            return self.response(False, error="临时文件策略无效")
+        self.app_config["default_model"] = model
+        self.app_config["default_device"] = device
+        save_config(self.app_config)
+        self.language = language
+        self.temp_policy = temp_policy
+        self.save_app_settings()
+        return self.response(message="设置已保存")
 
-        settings = self.normalize_settings(raw_settings)
-        if settings["output_mode"] == "custom" and not settings["output_path"]:
-            return self.response(False, error="请选择统一输出文件夹。")
-        invalid_urls = [
-            url for url in settings["source_urls"].values()
-            if not url.lower().startswith(("http://", "https://"))
-        ]
-        if invalid_urls:
-            return self.response(False, error="视频来源地址必须以 http:// 或 https:// 开头。")
-        if settings["llm_repair"] and not settings["deepseek_api_key"]:
-            return self.response(False, error="请填写 DeepSeek API Key，或关闭大模型校订。")
+    def _new_stage_state(self) -> list[dict[str, Any]]:
+        return [{"id": stage_id, "label": label, "status": "waiting", "progress": 0.0, "message": ""} for stage_id, label in STAGES]
 
-        missing = [item["path"] for item in self.files if not Path(item["path"]).is_file()]
-        if missing:
-            return self.response(False, error="部分文件已被移动或删除：\n" + "\n".join(missing[:8]))
+    def _set_stage(self, stage_id: str, status: str, progress: float = 0.0, message: str = "") -> None:
+        if not self.task:
+            return
+        for stage in self.task["stages"]:
+            if stage["id"] == stage_id:
+                stage.update(status=status, progress=round(max(0.0, min(progress, 100.0)), 2), message=message)
+                break
+        self.task["current_stage"] = stage_id
+        self.task["status_text"] = message or next(label for key, label in STAGES if key == stage_id)
+        self._update_overall()
+        self._persist_task()
 
-        command = [
-            str(PYTHON),
-            "-u",
-            str(TRANSCRIBER),
-            "--gui-events",
-            "--model",
-            settings["model"],
-            "--language",
-            settings["language"],
-            "--device",
-            settings["device"],
-        ]
-        if settings["skip_existing"]:
-            command.append("--skip-existing")
-        if settings["output_mode"] == "custom":
-            output = str(Path(settings["output_path"]).expanduser().resolve())
-            command.extend(("--output", output))
-            self.output_path = output
-        if settings["prompt"]:
-            command.extend(("--prompt", settings["prompt"]))
-        if self.source_map_file:
-            try:
-                self.source_map_file.unlink(missing_ok=True)
-            except OSError:
-                pass
-            self.source_map_file = None
-        if settings["source_urls"]:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                suffix=".json",
-                prefix="localtranscriber-source-",
-                delete=False,
-            ) as source_file:
-                json.dump(settings["source_urls"], source_file, ensure_ascii=False)
-                self.source_map_file = Path(source_file.name)
-            command.extend(("--source-url-map", str(self.source_map_file)))
-        command.extend(("--context-mode", settings["context_mode"]))
-        if settings["llm_repair"]:
-            command.extend(("--llm-repair", "--llm-model", "deepseek-v4-flash"))
-        command.extend(item["path"] for item in self.files)
+    def _update_overall(self) -> None:
+        if not self.task:
+            return
+        total = max(1, len(self.task.get("videos", [])))
+        completed = sum(item.get("status") == "completed" for item in self.task.get("videos", []))
+        stage_values = [float(item.get("progress", 0.0)) for item in self.task.get("stages", [])]
+        current_fraction = sum(stage_values) / (len(stage_values) * 100) if stage_values else 0.0
+        current_index = int(self.task.get("current_index", 0))
+        current_videos = self.task.get("videos", [])
+        current_done = 0 <= current_index < len(current_videos) and current_videos[current_index].get("status") == "completed"
+        self.task["overall_progress"] = round((completed + (0.0 if current_done else current_fraction)) / total * 100, 2)
 
+    def _persist_task(self) -> None:
+        if not self.task or not self.space_root:
+            return
+        try:
+            write_task(Path(self.space_root), self.task)
+        except (OSError, ValueError):
+            pass
+
+    def start_knowledge_task(self) -> dict[str, Any]:
+        if self.running:
+            return self.response(False, error="已有知识生成任务正在运行。")
+        if not self.space_root:
+            return self.response(False, error="请先选择知识空间。")
+        if not self.queue:
+            return self.response(False, error="请先选择视频或视频文件夹。")
+        if not self.api_ready():
+            return self.response(False, error="请先在设置中测试并保存 OpenAI 兼容接口。")
+        try:
+            persisted = create_task(Path(self.space_root), [item["source"] for item in self.queue])
+        except (OSError, ValueError) as exc:
+            return self.response(False, error=f"无法创建任务：{exc}")
         with self.lock:
+            self.task = {
+                **persisted,
+                "status": "running",
+                "started_at": iso_now(),
+                "current_index": 0,
+                "current_stage": "copy",
+                "status_text": "正在准备任务",
+                "overall_progress": 0.0,
+                "stages": self._new_stage_state(),
+                "hotword_profile": None,
+                "completed": 0,
+                "failed": 0,
+                "pending_confirmation": 0,
+                "resume_version": 1,
+            }
             self.running = True
             self.paused = False
             self.cancel_requested = False
-            self.status_before_pause = ""
-            self.result_dirs.clear()
-            self.log_lines.clear()
-            self.progress = 0.0
-            self.model_loading = True
-            selected_model_label = MODEL_LABELS[settings["model"]]
-            self.model_status = f"正在加载 {selected_model_label}"
-            self.status_text = f"正在加载本地模型（{selected_model_label}）…"
-            self.batch_summary = {"total": len(self.files), "completed": 0, "failed": 0, "skipped": 0}
-            for item in self.files:
-                item["status"] = "等待中"
-                item["progress"] = 0.0
-                item["source_url"] = settings["source_urls"].get(item["path"], "")
-                self.sync_history(item)
-            self.save_history()
+            self.activities.clear()
+            self.activity(f"任务开始，共 {len(self.queue)} 个视频")
+            self._persist_task()
+        threading.Thread(target=self._run_task_resumable, daemon=True).start()
+        return self.response(message="已经开始生成视频知识")
 
-        threading.Thread(
-            target=self.run_process,
-            args=(command, settings["deepseek_api_key"] if settings["llm_repair"] else ""),
-            daemon=True,
-        ).start()
-        task_label = "单个转写" if len(self.files) == 1 else f"批量转写（{len(self.files)} 个文件）"
-        self.notify("task_start")
-        return self.response(message=f"{task_label}已开始")
+    def _run_task_resumable(self) -> None:
+        run_resumable_task(
+            self,
+            python=PYTHON,
+            knowledge_worker=KNOWLEDGE_WORKER,
+            transcriber=TRANSCRIBER,
+            reviewer=WHOLE_FILE_REVIEW,
+        )
 
-    def run_process(self, command: list[str], deepseek_api_key: str = "") -> None:
+    def continue_knowledge_task(self) -> dict[str, Any]:
+        if self.running:
+            return self.response(False, error="当前任务已经在运行。")
+        if not self.task or self.task.get("status") not in {"interrupted", "cancelled", "failed", "needs_attention"}:
+            return self.response(False, error="没有可以继续的任务。")
+        unresolved = [item for item in self.task.get("videos", []) if item.get("status") == "needs_confirmation"]
+        retryable = [item for item in self.task.get("videos", []) if item.get("status") in {"failed", "interrupted", "waiting", "processing"}]
+        if unresolved and not retryable:
+            return self.response(False, error="请先确认当前视频的专业词汇。")
+        for video in self.task.get("videos", []):
+            if video.get("status") == "failed":
+                video["status"] = "interrupted"
+        self.task["status"] = "running"
+        self.task["status_text"] = "正在从已保存的阶段继续"
+        self.running = True
+        self.paused = False
+        self.cancel_requested = False
+        self.activity("从断点继续任务，已完成阶段不会重复执行")
+        self._persist_task()
+        threading.Thread(target=self._run_task_resumable, daemon=True).start()
+        return self.response(message="已从断点继续任务")
+
+    def _client(self) -> OpenAICompatibleClient:
+        return OpenAICompatibleClient(
+            base_url=self.api_base_url,
+            model=self.api_model,
+            api_key=self.api_key,
+            allow_remote=True,
+            timeout=180,
+        )
+
+    def _run_subprocess(self, command: list[str], extra_env: dict[str, str], phase: str) -> None:
         env = os.environ.copy()
+        env.update(extra_env)
         env["PYTHONUTF8"] = "1"
-        env["PYTHONUNBUFFERED"] = "1"
-        env["HF_HOME"] = self.hf_cache_dir
-        if deepseek_api_key:
-            env["DEEPSEEK_API_KEY"] = deepseek_api_key
-        deepseek_api_key = ""
-        code = -1
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=str(APP_DIR),
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-            self.process = process
-            assert process.stdout is not None
-            for raw_line in process.stdout:
-                line = raw_line.rstrip("\r\n")
-                if line.startswith(EVENT_PREFIX):
-                    try:
-                        self.handle_event(json.loads(line[len(EVENT_PREFIX) :]))
-                    except json.JSONDecodeError:
-                        self.append_log(line)
-                else:
-                    self.append_log(line)
-            code = process.wait()
-        except Exception as exc:
-            self.append_log(f"启动失败：{type(exc).__name__}: {exc}")
-        finally:
-            self.process = None
-            self.finish(code)
-
-    def find_file(self, source: str) -> dict[str, Any] | None:
-        key = path_key(source)
-        return next((item for item in self.files if path_key(item["path"]) == key), None)
-
-    def handle_event(self, event: dict[str, Any]) -> None:
-        kind = str(event.get("event", ""))
-        source = str(event.get("source", ""))
-        with self.lock:
-            item = self.find_file(source) if source else None
-            if kind == "source_context_loading":
-                self.model_loading = True
-                self.model_status = "正在读取来源上下文"
-                self.status_text = "正在从来源页面提取人物和专业词汇…"
-            elif kind == "source_context_ready":
-                title = str(event.get("title", ""))
-                term_count = int(event.get("term_count", 0))
-                self.model_status = f"来源上下文已就绪 · {term_count} 个词"
-                self.status_text = f"已读取来源：{title}" if title else "来源上下文已就绪"
-            elif kind == "source_context_error":
-                self.model_status = "来源上下文不可用"
-                self.status_text = "来源页面读取失败，将继续本地转写"
-            elif kind == "file_retry":
-                self.status_text = "检测到异常重复，正在自动使用安全模式重试…"
-            elif kind == "llm_repair_start" and item:
-                item["status"] = "大模型校订中"
-                item["progress"] = 0.0
-                self.progress = 0.0
-                self.status_text = "正在使用 DeepSeek 结合上下文校订…"
-            elif kind == "llm_repair_progress" and item:
-                progress = float(event.get("progress", 0.0))
-                item["status"] = "大模型校订中"
-                item["progress"] = progress
-                self.progress = progress
-                self.status_text = f"DeepSeek 校订：{int(event.get('current', 0))}/{int(event.get('total', 0))}"
-            elif kind == "llm_repair_done" and item:
-                item["status"] = "校订完成"
-                item["progress"] = 100.0
-                self.progress = 100.0
-            elif kind == "model_loading":
-                model_name = str(event.get("model", "medium"))
-                model_label = MODEL_LABELS.get(model_name, model_name)
-                device = str(event.get("device", ""))
-                self.model_loading = True
-                self.model_status = f"正在加载 {model_label} · {device.upper()}"
-                self.status_text = f"正在加载本地模型（{model_label} · {device}）…"
-            elif kind == "model_ready":
-                model_name = str(event.get("model", "medium"))
-                model_label = MODEL_LABELS.get(model_name, model_name)
-                device = str(event.get("device", ""))
-                self.model_loading = False
-                self.model_status = f"{model_label} · {device.upper()}"
-                self.status_text = "模型已就绪，准备转写"
-            elif kind == "file_start" and item:
-                item["status"] = "转写中"
-                item["progress"] = 0.0
-                self.progress = 0.0
-                self.status_text = f"正在转写：{item['name']}"
-            elif kind == "file_progress" and item:
-                progress = float(event.get("progress", 0.0))
-                item["status"] = "转写中"
-                item["progress"] = progress
-                self.progress = progress
-                timestamp = str(event.get("timestamp", ""))
-                self.status_text = f"正在转写：{item['name']}  {progress:.1f}%  {timestamp}"
-            elif kind == "file_done" and item:
-                item["status"] = "已完成"
-                item["progress"] = 100.0
-                self.progress = 100.0
-                output_dir = event.get("output_dir")
-                if output_dir:
-                    self.result_dirs[path_key(source)] = Path(str(output_dir))
-                self.sync_history(
-                    item,
-                    output_dir=str(output_dir) if output_dir else None,
-                    outputs=[str(value) for value in event.get("outputs", [])],
-                    persist=True,
-                )
-            elif kind == "file_skipped" and item:
-                item["status"] = "已有结果"
-                item["progress"] = 100.0
-                output_dir = event.get("output_dir")
-                if output_dir:
-                    self.result_dirs[path_key(source)] = Path(str(output_dir))
-                self.sync_history(
-                    item,
-                    output_dir=str(output_dir) if output_dir else None,
-                    outputs=[str(value) for value in event.get("outputs", [])],
-                    persist=True,
-                )
-            elif kind == "file_error" and item:
-                item["status"] = "失败"
-                error = str(event.get("error", "未知错误"))
-                self.append_log(f"{item['name']}：{error}", notify=False)
-                self.sync_history(item, persist=True)
-            elif kind == "batch_done":
-                self.batch_summary = {
-                    "total": int(event.get("total", 0)),
-                    "completed": int(event.get("completed", 0)),
-                    "failed": int(event.get("failed", 0)),
-                    "skipped": int(event.get("skipped", 0)),
-                }
-            if item and kind in {
-                "file_start", "file_progress", "file_retry", "llm_repair_start",
-                "llm_repair_progress", "llm_repair_done",
-            }:
-                self.sync_history(item)
-        self.notify(kind, source=source)
-
-    def append_log(self, text: str, notify: bool = True) -> None:
-        text = text.strip()
-        if not text:
-            return
-        with self.lock:
-            self.log_lines.append(text)
-            if len(self.log_lines) > 500:
-                self.log_lines = self.log_lines[-500:]
-        if notify:
-            self.notify("log")
-
-    def finish(self, code: int) -> None:
-        with self.lock:
-            self.running = False
-            self.paused = False
-            self.status_before_pause = ""
-            self.model_loading = False
-            try:
-                LOG_FILE.write_text("\n".join(self.log_lines) + "\n", encoding="utf-8")
-            except OSError:
-                pass
-
+        env["PYTHONIOENCODING"] = "utf-8"
+        process = subprocess.Popen(
+            command,
+            cwd=str(APP_DIR),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self.process = process
+        assert process.stdout is not None
+        for raw_line in process.stdout:
             if self.cancel_requested:
-                self.status_text = "已取消转写；已完成的结果仍然保留"
-                for item in self.files:
-                    if item["status"] in {"等待中", "转写中"}:
-                        item["status"] = "已取消"
-                        self.sync_history(item)
-                message = "转写已取消，已完成的结果仍然保留"
-                level = "info"
-            else:
-                completed = self.batch_summary["completed"]
-                failed = self.batch_summary["failed"]
-                skipped = self.batch_summary["skipped"]
-                total = self.batch_summary["total"] or len(self.files)
-                is_single = len(self.files) == 1
-                if is_single and code == 0 and completed == 1:
-                    self.status_text = f"转写完成：{self.files[0]['name']}"
-                    message = self.status_text
-                    level = "info"
-                elif is_single and code == 0 and skipped == 1:
-                    self.status_text = f"已有完整结果：{self.files[0]['name']}"
-                    message = self.status_text
-                    level = "info"
-                elif is_single:
-                    self.status_text = f"转写失败：{self.files[0]['name']}"
-                    message = self.status_text
-                    level = "error"
-                elif code == 0 and completed + skipped == total:
-                    self.status_text = f"批量转写完成：新转写 {completed} 个，跳过已有 {skipped} 个"
-                    message = self.status_text
-                    level = "info"
-                elif completed or failed or skipped:
-                    self.status_text = f"批量转写结束：成功 {completed} 个，已有 {skipped} 个，失败 {failed} 个"
-                    message = self.status_text
-                    level = "error" if failed else "info"
-                else:
-                    self.status_text = "转写未能启动，请查看运行信息"
-                    message = self.status_text
-                    level = "error"
-            self.save_history()
-        if self.source_map_file:
-            try:
-                self.source_map_file.unlink(missing_ok=True)
-            except OSError:
-                pass
-            self.source_map_file = None
-        self.notify("process_done", message=message, level=level)
-
-    def pause_transcription(self) -> dict[str, Any]:
-        if not self.running:
-            return self.response(False, error="当前没有正在运行的转写任务。")
-        if self.paused:
-            return self.response()
-        process = self.process
-        if process is None or process.poll() is not None:
-            return self.response(False, error="任务正在启动，请稍后再暂停。")
-        if not set_process_suspended(process.pid, True):
-            return self.response(False, error="暂停失败，请稍后重试。")
-        with self.lock:
-            self.paused = True
-            self.status_before_pause = self.status_text
-            active_item = next((item for item in self.files if item["status"] == "转写中"), None)
-            if active_item:
-                active_item["status"] = "已暂停"
-                self.status_text = f"已暂停：{active_item['name']}"
-            else:
-                self.status_text = "转写任务已暂停"
-        return self.response(message="转写已暂停，可随时继续")
-
-    def resume_transcription(self) -> dict[str, Any]:
-        if not self.running:
-            return self.response(False, error="当前没有正在运行的转写任务。")
-        if not self.paused:
-            return self.response()
-        process = self.process
-        if process is None or process.poll() is not None:
-            return self.response(False, error="任务进程已经结束。")
-        if not set_process_suspended(process.pid, False):
-            return self.response(False, error="继续转写失败，请稍后重试。")
-        with self.lock:
-            self.paused = False
-            active_item = next((item for item in self.files if item["status"] == "已暂停"), None)
-            if active_item:
-                active_item["status"] = "转写中"
-            self.status_text = self.status_before_pause or "正在继续转写…"
-            self.status_before_pause = ""
-        return self.response(message="已继续转写")
-
-    def cancel_transcription(self) -> dict[str, Any]:
-        if not self.running or self.cancel_requested:
-            return self.response()
-        with self.lock:
-            self.cancel_requested = True
-            self.status_text = "正在取消…"
-        process = self.process
-        if process and process.poll() is None:
-            try:
-                if self.paused:
-                    set_process_suspended(process.pid, False)
-                    self.paused = False
                 process.terminate()
-            except OSError:
-                pass
-        return self.response(message="正在停止当前批次")
-
-    def resolve_result_dir(self, source: str, settings: dict[str, Any]) -> Path:
-        key = path_key(source)
-        result_dir = self.result_dirs.get(key)
-        history_record = self.history.get(key, {})
-        if result_dir is None and history_record.get("result_dir"):
-            result_dir = Path(str(history_record["result_dir"]))
-        if result_dir is None:
-            if settings["output_mode"] == "custom" and settings["output_path"]:
-                result_dir = Path(settings["output_path"]).expanduser().resolve()
+                break
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith(EVENT_PREFIX):
+                try:
+                    event = json.loads(line[len(EVENT_PREFIX) :])
+                except json.JSONDecodeError:
+                    continue
+                self._handle_worker_event(phase, event)
             else:
-                result_dir = Path(source).expanduser().resolve().parent / "转写结果"
-        return result_dir
+                LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+                with LOG_FILE.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+        code = process.wait()
+        self.process = None
+        if self.cancel_requested:
+            raise RuntimeError("任务已取消")
+        if code != 0:
+            raise RuntimeError(f"{phase} 阶段执行失败，退出码 {code}")
 
-    def result_candidates(
-        self,
-        source: str,
-        settings: dict[str, Any],
-        material: str,
-    ) -> list[Path]:
-        key = path_key(source)
-        history_record = self.history.get(key, {})
-        recorded = [Path(str(value)) for value in history_record.get("outputs", [])]
-        result_dir = self.resolve_result_dir(source, settings)
-        source_path = Path(source).expanduser().resolve()
-        base_stem = source_path.stem if settings["model"] == "medium" else f"{source_path.stem}.{settings['model']}"
+    def _handle_worker_event(self, phase: str, event: dict[str, Any]) -> None:
+        kind = str(event.get("event") or "")
+        if phase == "analyze":
+            if kind == "task_hotwords_sample_start":
+                self._set_stage("analyze", "running", 20, "正在提取样本文字")
+            elif kind == "task_hotwords_sample_done":
+                self._set_stage("analyze", "running", 55, f"样本文字 {int(event.get('sample_chars', 0))} 字")
+            elif kind == "task_hotwords_extracting":
+                self._set_stage("analyze", "running", 75, "正在判断内容与专业词汇")
+            elif kind == "task_hotwords_ready":
+                self._set_stage("analyze", "running", 95, "专业词汇建议已生成")
+        elif phase == "transcribe":
+            if kind == "file_progress":
+                value = float(event.get("progress", 0.0))
+                self._set_stage("transcribe", "running", value, f"正在全文转录 · {value:.0f}%")
+        elif phase == "verify":
+            if kind == "clean_file_progress":
+                value = float(event.get("progress", 0.0))
+                stage = str(event.get("stage") or "")
+                if stage == "review_chunk":
+                    current = int(event.get("current", 0))
+                    total = max(1, int(event.get("total", 1)) - 2)
+                    detail = f"正在分段可信校对 · {min(current, total)}/{total}"
+                elif stage == "global_consistency":
+                    detail = "正在进行全局一致性检查"
+                elif stage == "apply":
+                    detail = "正在应用安全修正"
+                else:
+                    detail = f"正在可信校对 · {value:.0f}%"
+                self._set_stage("verify", "running", value, detail)
+        self.notify("task_progress")
 
-        if material == "corrections":
-            preferred = [path for path in recorded if path.name.endswith(".llm-corrections.json")]
-            preferred.append(result_dir / f"{base_stem}.llm-corrections.json")
-            preferred.extend(sorted(result_dir.glob(f"{source_path.stem}*.llm-corrections.json"), key=lambda path: path.name.casefold(), reverse=True))
-            return preferred
-        markdown_files = [path for path in recorded if path.suffix.lower() == ".md"]
-        if material == "raw":
-            preferred = [path for path in markdown_files if not path.name.endswith(".llm.md")]
-            preferred.append(result_dir / f"{base_stem}.md")
-            preferred.extend(
-                path for path in sorted(result_dir.glob(f"{source_path.stem}*.md"), key=lambda path: path.name.casefold(), reverse=True)
-                if not path.name.endswith(".llm.md")
-            )
-            return preferred
-        preferred = [path for path in markdown_files if path.name.endswith(".llm.md")]
-        preferred.extend(path for path in markdown_files if not path.name.endswith(".llm.md"))
-        preferred.extend((result_dir / f"{base_stem}.llm.md", result_dir / f"{base_stem}.md"))
-        preferred.extend(sorted(result_dir.glob(f"{source_path.stem}*.llm.md"), key=lambda path: path.name.casefold(), reverse=True))
-        preferred.extend(
-            path for path in sorted(result_dir.glob(f"{source_path.stem}*.md"), key=lambda path: path.name.casefold(), reverse=True)
-            if not path.name.endswith(".llm.md")
+    def confirm_hotwords(self, words: list[str] | str, category: str = "") -> dict[str, Any]:
+        if not self.task or self.task.get("current_stage") != "confirm":
+            return self.response(False, error="当前没有等待确认的专业词汇。")
+        values = (
+            [item.strip() for item in words.replace("，", ",").split(",") if item.strip()]
+            if isinstance(words, str)
+            else [str(item).strip() for item in words if str(item).strip()]
         )
-        return preferred
-
-    def read_result(
-        self,
-        source: str,
-        raw_settings: dict[str, Any],
-        material: str = "accurate",
-    ) -> dict[str, Any]:
-        key = path_key(source)
-        if self.find_file(source) is None and key not in self.history:
-            return self.response(False, error="没有找到这条转写记录。")
-        settings = self.normalize_settings(raw_settings)
-        material = material if material in {"accurate", "raw", "corrections"} else "accurate"
-        candidates = self.result_candidates(source, settings, material)
-        result_path = next((path for path in candidates if path.is_file()), None)
-        if result_path is None:
-            item = self.find_file(source)
-            record = item or self.history.get(key, {})
-            status = str(record.get("status", ""))
-            if status in {"等待中", "模型加载中", "转写中", "已暂停", "大模型校订中", "校订完成"}:
-                return self.response(False, pending=True)
-            if material == "corrections":
-                return self.response(
-                    False,
-                    unavailable=True,
-                    reason="本次任务没有生成校订记录",
-                )
-            return self.response(False, error="该任务还没有生成对应内容。")
+        values = list(dict.fromkeys(values))[:80]
         try:
-            if material != "corrections":
-                content = result_path.read_text(encoding="utf-8-sig")
-            else:
-                payload = json.loads(result_path.read_text(encoding="utf-8"))
-                corrections = payload.get("corrections", []) if isinstance(payload, dict) else []
-                accepted = [item for item in corrections if isinstance(item, dict) and item.get("accepted")]
-                lines = ["# 校订记录", "", f"共接受 {len(accepted)} 处校订。", ""]
-                for item in accepted:
-                    start = float(item.get("start") or 0.0)
-                    minutes, seconds = divmod(int(start), 60)
-                    lines.extend(
-                        (
-                            f"## [{minutes:02d}:{seconds:02d}]",
-                            "",
-                            f"- 原文：{item.get('original', '')}",
-                            f"- 校订：{item.get('corrected', '')}",
-                            f"- 原因：{item.get('reason', '') or '上下文校订'}",
-                            "",
-                        )
-                    )
-                content = "\n".join(lines)
-        except (OSError, json.JSONDecodeError) as exc:
-            return self.response(False, error=f"读取结果失败：{exc}")
-        return self.response(content=content, filename=result_path.name, path=str(result_path))
+            prepare_manual_confirmation(self, values, category)
+        except (OSError, ValueError) as exc:
+            return self.response(False, error=f"无法保存专业词汇：{exc}")
+        response = self.continue_knowledge_task()
+        if response.get("ok"):
+            response["message"] = f"已确认 {len(values)} 个专业词汇，并从断点继续"
+        return response
 
-    def open_result(self, source: str, raw_settings: dict[str, Any]) -> dict[str, Any]:
-        key = path_key(source)
-        item = self.find_file(source)
-        if item is None and key not in self.history:
-            return self.response(False, error="没有找到选中的文件。")
-        settings = self.normalize_settings(raw_settings)
-        result_dir = self.resolve_result_dir(source, settings)
-        if not result_dir.is_dir():
-            return self.response(False, error="该文件还没有生成转写结果。")
-        os.startfile(result_dir)
-        return self.response()
+    def pause_task(self) -> dict[str, Any]:
+        if not self.running or self.paused:
+            return self.response(False, error="当前任务不能暂停。")
+        process = self.process
+        if process is None or process.poll() is not None or not set_process_suspended(process.pid, True):
+            return self.response(False, error="当前阶段暂不支持暂停。")
+        self.paused = True
+        self.activity("任务已暂停")
+        return self.response(message="任务已暂停")
 
-    def on_closing(self) -> bool:
+    def resume_task(self) -> dict[str, Any]:
+        if not self.running or not self.paused:
+            return self.response(False, error="当前任务没有暂停。")
+        process = self.process
+        if process is None or process.poll() is not None or not set_process_suspended(process.pid, False):
+            return self.response(False, error="无法继续当前任务。")
+        self.paused = False
+        self.activity("任务已继续")
+        return self.response(message="任务已继续")
+
+    def cancel_task(self) -> dict[str, Any]:
         if not self.running:
-            return True
-        window = self.window
-        if window is None:
-            return False
-        should_close = window.create_confirmation_dialog(
-            "转写仍在进行",
-            "关闭窗口会停止当前批次，已完成的结果会保留。确定关闭吗？",
-        )
-        if not should_close:
-            return False
+            return self.response(False, error="当前没有运行中的任务。")
         self.cancel_requested = True
         process = self.process
         if process and process.poll() is None:
             try:
                 if self.paused:
                     set_process_suspended(process.pid, False)
-                    self.paused = False
                 process.terminate()
             except OSError:
                 pass
-        return True
+        return self.response(message="正在取消任务，已完成成果会保留")
+
+    def retry_failed_task(self) -> dict[str, Any]:
+        return self.continue_knowledge_task()
+
+    def cleanup_task(self) -> dict[str, Any]:
+        if self.running:
+            return self.response(False, error="任务进行中，不能清理临时文件。")
+        if not self.task or self.task.get("status") not in {"completed", "cancelled", "failed"}:
+            return self.response(False, error="没有可清理的已结束任务。")
+        try:
+            removed = clean_task_work(Path(self.space_root), str(self.task["task_id"]))
+        except (OSError, ValueError) as exc:
+            return self.response(False, error=f"清理失败：{exc}")
+        if removed:
+            self.activity("已清理本次任务临时文件")
+        self.task = None
+        self.queue.clear()
+        return self.response(message="临时文件已清理；视频、索引和 Obsidian Wiki 均已保留")
+
+    def ask_knowledge(self, question: str) -> dict[str, Any]:
+        text = str(question or "").strip()
+        if not text:
+            return self.response(False, error="请输入问题。")
+        if not self.space_root:
+            return self.response(False, error="请先选择知识空间。")
+        if not self.api_ready():
+            return self.response(False, error="请先配置并测试 OpenAI 兼容接口。")
+        with self.lock:
+            if self.chat_running:
+                return self.response(False, error="上一条问题仍在处理中。")
+            conversation = [dict(item) for item in self.messages[-6:]]
+            space_root = self.space_root
+            self.messages.append({"role": "user", "content": text, "created_at": iso_now()})
+            self.chat_running = True
+        threading.Thread(target=self._answer_knowledge, args=(space_root, text, conversation), daemon=True).start()
+        return self.response()
+
+    def _answer_knowledge(self, space_root: str, question: str, conversation: list[dict[str, Any]]) -> None:
+        try:
+            result = answer_question(Path(space_root), question, self._client(), conversation=conversation)
+            message = {
+                "role": "assistant",
+                "content": result["answer"],
+                "citations": result["citations"],
+                "created_at": iso_now(),
+            }
+            with self.lock:
+                self.messages.append(message)
+        except Exception as exc:
+            with self.lock:
+                self.messages.append({"role": "assistant", "content": f"检索失败：{exc}", "citations": [], "error": True, "created_at": iso_now()})
+        finally:
+            self.chat_running = False
+            self.notify("chat_done", force=True)
+
+    def clear_chat(self) -> dict[str, Any]:
+        with self.lock:
+            if self.chat_running:
+                return self.response(False, error="上一条问答仍在处理中，暂时不能清空对话。")
+            self.messages.clear()
+        return self.response()
+
+    def get_video_source(self, path: str, start: Any = 0) -> dict[str, Any]:
+        target = Path(path).expanduser().resolve()
+        if not target.is_file():
+            return self.response(False, error="视频文件不可用，请重新关联。")
+        return self.response(uri=target.as_uri(), start=max(0.0, float(start)))
+
+    def relink_missing_video(self, video_id: str) -> dict[str, Any]:
+        if self.window is None or not self.space_root:
+            return self.response(False, error="当前无法重新关联视频。")
+        selected = self.window.create_file_dialog(webview.FileDialog.OPEN, allow_multiple=False, file_types=MEDIA_DIALOG_TYPES)
+        if not selected:
+            return self.response()
+        try:
+            result = relink_video(Path(self.space_root), video_id, Path(selected[0]))
+        except (OSError, ValueError, KeyError) as exc:
+            return self.response(False, error=f"重新关联失败：{exc}")
+        return self.response(message="视频已重新关联", path=result["path"])
+
+    def on_closing(self) -> bool:
+        if not self.running:
+            return True
+        if self.window is None:
+            return False
+        should_close = self.window.create_confirmation_dialog(
+            "知识生成仍在进行",
+            "关闭窗口会停止当前任务，已经完成的视频知识会保留。确定关闭吗？",
+        )
+        if should_close:
+            self.cancel_task()
+        return bool(should_close)
 
 
 def smoke_test() -> None:
@@ -929,31 +874,23 @@ def smoke_test() -> None:
         raise FileNotFoundError(UI_FILE)
     if not ICON_FILE.is_file():
         raise FileNotFoundError(ICON_FILE)
-    lucide_script = APP_DIR / "ui" / "vendor" / "lucide.min.js"
-    lucide_license = APP_DIR / "ui" / "vendor" / "LUCIDE-LICENSE"
-    if not lucide_script.is_file():
-        raise FileNotFoundError(lucide_script)
-    if not lucide_license.is_file():
-        raise FileNotFoundError(lucide_license)
     html = UI_FILE.read_text(encoding="utf-8")
     script = (APP_DIR / "ui" / "app.js").read_text(encoding="utf-8")
-    if "window.LocalTranscriber" not in script:
-        raise RuntimeError("前端事件入口缺失")
-    if "自动识别（仅转写）" not in html:
-        raise RuntimeError("语言默认选项缺失")
-    if "modelSelect" not in html:
-        raise RuntimeError("转写模型配置缺失")
-    if "pauseButton" not in html:
-        raise RuntimeError("暂停和继续控制缺失")
-    if "补充视频来源（可选）" not in script or "source_urls" not in script:
-        raise RuntimeError("逐文件来源上下文缺失")
-    if "llmRepair" not in html or "deepseekApiKey" not in html:
-        raise RuntimeError("DeepSeek 校订设置缺失")
-    if "historyList" not in html or "markdownPreview" not in html:
-        raise RuntimeError("内容历史或 Markdown 查看器缺失")
-    if 'vendor/lucide.min.js' not in html or 'data-lucide=' not in html:
-        raise RuntimeError("本地 Lucide 图标资源缺失")
-    TranscriberApi()
+    required_html = (
+        "knowledgeGenerationView", "knowledgeChatView", "chooseVideoFolderButton",
+        "taskStages", "appendVideosButton", "appendFolderButton", "aiBaseUrl", "testAiButton", "knowledgeComposer", "evidencePlayer",
+    )
+    for value in required_html:
+        if value not in html:
+            raise RuntimeError(f"界面缺少：{value}")
+    required_script = (
+        "window.LocalTranscriber", "start_knowledge_task", "confirm_hotwords",
+        "ask_knowledge", "relink_missing_video", "cleanup_task",
+    )
+    for value in required_script:
+        if value not in script:
+            raise RuntimeError(f"前端逻辑缺少：{value}")
+    KnowledgeApi()
     print("GUI_SMOKE_OK")
 
 
@@ -961,23 +898,30 @@ def main() -> None:
     if "--smoke-test" in sys.argv:
         smoke_test()
         return
-    configure_app_identity()
-    initial_files = tuple(arg for arg in sys.argv[1:] if not arg.startswith("--"))
-    api = TranscriberApi(initial_files)
-    window = webview.create_window(
-        "本地语音转写",
-        url=UI_FILE.resolve().as_uri(),
-        js_api=api,
-        width=1120,
-        height=760,
-        min_size=(900, 620),
-        background_color="#F3F5F8",
-        text_select=False,
-    )
-    assert window is not None
-    api.attach_window(window)
-    window.events.closing += api.on_closing
-    webview.start(debug=False, private_mode=True, icon=str(ICON_FILE))
+    if not acquire_single_instance():
+        if sys.platform == "win32":
+            ctypes.windll.user32.MessageBoxW(None, "LocalTranscriber 已在运行。", "LocalTranscriber", 0x40)
+        return
+    try:
+        configure_app_identity()
+        initial_files = tuple(item for item in sys.argv[1:] if not item.startswith("--"))
+        api = KnowledgeApi(initial_files)
+        window = webview.create_window(
+            "LocalTranscriber 视频知识库",
+            url=UI_FILE.resolve().as_uri(),
+            js_api=api,
+            width=1120,
+            height=760,
+            min_size=(900, 620),
+            background_color="#FFFFFF",
+            text_select=False,
+        )
+        assert window is not None
+        api.attach_window(window)
+        window.events.closing += api.on_closing
+        webview.start(debug=False, private_mode=True, icon=str(ICON_FILE))
+    finally:
+        release_single_instance()
 
 
 if __name__ == "__main__":

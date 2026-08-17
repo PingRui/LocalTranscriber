@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import shutil
+import sys
 from pathlib import Path
 
 from app_config import (
@@ -17,6 +18,17 @@ from app_config import (
 MINIMUM_FREE_BYTES = 2 * 1024**3
 
 
+def print_console(message: str) -> None:
+    """Print user-facing text without crashing on legacy Windows code pages."""
+    try:
+        print(message)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        safe_message = message.encode(encoding, errors="replace").decode(encoding)
+        sys.stdout.write(safe_message + "\n")
+        sys.stdout.flush()
+
+
 def install_model(model_name: str) -> Path:
     if model_name not in SUPPORTED_MODELS:
         raise ValueError(f"不支持的模型：{model_name}")
@@ -25,12 +37,12 @@ def install_model(model_name: str) -> Path:
     destination = model_paths(config)[model_name]
     destination.parent.mkdir(parents=True, exist_ok=True)
     if (destination / "model.bin").is_file() and (destination / "config.json").is_file():
-        print(f"模型已存在：{destination}")
+        print_console(f"模型已存在：{destination}")
     else:
         free_bytes = shutil.disk_usage(destination.parent).free
         if free_bytes < MINIMUM_FREE_BYTES:
             raise RuntimeError("模型目录可用空间不足 2GB，请释放空间后重试。")
-        print(f"正在下载 {model_name}，首次安装约需 1.5GB，请保持网络连接…")
+        print_console(f"正在下载 {model_name}，首次安装约需 1.5GB，请保持网络连接…")
         from huggingface_hub import snapshot_download
 
         snapshot_download(
@@ -48,17 +60,17 @@ def install_model(model_name: str) -> Path:
 
     config["default_model"] = model_name
     save_config(config)
-    print(f"默认模型：{model_name}")
-    print(f"模型目录：{destination}")
+    print_console(f"默认模型：{model_name}")
+    print_console(f"模型目录：{destination}")
     return destination
 
 
 def show_status() -> None:
     config = load_config()
     available = installed_models(config)
-    print(f"默认模型：{config['default_model']}")
-    print(f"模型目录：{config['model_root']}")
-    print("已安装模型：" + (", ".join(available) if available else "无"))
+    print_console(f"默认模型：{config['default_model']}")
+    print_console(f"模型目录：{config['model_root']}")
+    print_console("已安装模型：" + (", ".join(available) if available else "无"))
 
 
 def main() -> int:
