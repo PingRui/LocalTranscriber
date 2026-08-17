@@ -26,6 +26,7 @@ CLAIMS_NAME = "claims.jsonl"
 RELATIONS_NAME = "relations.jsonl"
 SCHEMA_NAME = "schema.md"
 METADATA_NAME = "metadata.json"
+SPACE_MANIFEST_NAME = "space.json"
 WIKI_INDEX_NAME = "index.md"
 WIKI_LOG_NAME = "log.md"
 OBSIDIAN_CONCEPT_FOLDER = "概念"
@@ -57,6 +58,7 @@ def space_paths(root: Path) -> dict[str, Path]:
         "relations": knowledge / RELATIONS_NAME,
         "schema": knowledge / SCHEMA_NAME,
         "metadata": knowledge / METADATA_NAME,
+        "manifest": knowledge / SPACE_MANIFEST_NAME,
     }
 
 
@@ -106,7 +108,34 @@ def initialize_space(root: Path) -> dict[str, str]:
             )
             + "\n",
         )
+    if not paths["manifest"].exists():
+        _atomic_write_text(
+            paths["manifest"],
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "space_id": f"space-{uuid.uuid4().hex}",
+                    "created_at": iso_now(),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+        )
     return {key: str(value) for key, value in paths.items()}
+
+
+def load_space_manifest(root: Path) -> dict[str, Any]:
+    initialize_space(root)
+    payload = _load_json_object(space_paths(root)["manifest"], {})
+    space_id = str(payload.get("space_id") or "").strip()
+    if not re.fullmatch(r"space-[a-f0-9]{32}", space_id):
+        raise ValueError("知识空间身份文件损坏")
+    return {
+        "schema_version": int(payload.get("schema_version") or 1),
+        "space_id": space_id,
+        "created_at": str(payload.get("created_at") or ""),
+    }
 
 
 def _atomic_write_text(target: Path, content: str) -> None:
@@ -459,6 +488,9 @@ def _persist_trusted_source(
         for segment in trusted_segments
     ]
     _write_jsonl(directory / "evidence-units.jsonl", evidence_units, "evidence_id")
+    metadata = _load_metadata(root)
+    metadata["evidence_updated_at"] = iso_now()
+    _write_metadata(root, metadata)
     return evidence_units
 
 

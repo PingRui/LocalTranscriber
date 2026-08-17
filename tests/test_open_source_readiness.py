@@ -17,8 +17,12 @@ class OpenSourceReadinessTests(unittest.TestCase):
             "SECURITY.md",
             "THIRD_PARTY_NOTICES.md",
             "docs/ARCHITECTURE.md",
+            "docs/AGENT_KNOWLEDGE_V2.md",
             "docs/CODEX_LOCAL_MODEL_ASSIST.md",
+            "install-agent.ps1",
+            "requirements-mcp.txt",
             "verify.ps1",
+            "安装Agent接入.cmd",
         )
         for relative_path in required:
             self.assertTrue((ROOT / relative_path).is_file(), f"missing {relative_path}")
@@ -30,6 +34,7 @@ class OpenSourceReadinessTests(unittest.TestCase):
             ROOT / "transcribe.py",
             ROOT / "gui.pyw",
             ROOT / "install.ps1",
+            ROOT / "install-agent.ps1",
             ROOT / "select_and_transcribe.ps1",
             ROOT / "开始本地转写.cmd",
             ROOT / "README.md",
@@ -58,13 +63,25 @@ class OpenSourceReadinessTests(unittest.TestCase):
         workflow = (ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
         verifier = (ROOT / "verify.ps1").read_text(encoding="utf-8-sig")
         self.assertIn(".\\verify.ps1 -Python python", workflow)
-        for entrypoint in ("batch_clean.py", "knowledge_space.py", "knowledge_worker.py", "llm_client.py", "trusted_pipeline.py"):
+        for entrypoint in (
+            "batch_clean.py",
+            "evidence_player.py",
+            "knowledge_service.py",
+            "localtranscriber_mcp.py",
+            "knowledge_space.py",
+            "knowledge_worker.py",
+            "llm_client.py",
+            "trusted_pipeline.py",
+        ):
             self.assertIn(entrypoint, verifier)
+        self.assertIn("requirements-mcp.txt", workflow)
 
     def test_portable_launchers_use_project_directory(self):
         launcher = (ROOT / "开始本地转写.cmd").read_text(encoding="utf-8-sig")
+        agent_launcher = (ROOT / "安装Agent接入.cmd").read_text(encoding="utf-8-sig")
         installer = (ROOT / "install.ps1").read_text(encoding="utf-8-sig")
         self.assertIn("%~dp0", launcher)
+        self.assertIn("%~dp0", agent_launcher)
         self.assertIn("$MyInvocation.MyCommand.Path", installer)
 
 

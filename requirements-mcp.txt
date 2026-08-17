@@ -1,0 +1,2 @@
+# Optional Agent integration. The desktop application remains on requirements.txt.
+mcp==2.0.0; python_version >= "3.10"

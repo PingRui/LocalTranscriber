@@ -21,8 +21,8 @@
         <button id="navGenerate" class="nav-item active" data-view="generation">
           <i data-lucide="sparkles"></i><span>生成知识</span>
         </button>
-        <button id="navChat" class="nav-item" data-view="chat">
-          <i data-lucide="message-square-text"></i><span>知识检索</span>
+        <button id="navAgent" class="nav-item" data-view="agent">
+          <i data-lucide="plug-zap"></i><span>Agent 接入</span>
         </button>
       </nav>
 
@@ -143,7 +143,7 @@
                 <button id="retryButton" class="button primary"><i data-lucide="history"></i>从断点继续</button>
               </div>
               <div id="completedActions" class="compact-actions hidden">
-                <button id="goChatButton" class="button primary"><i data-lucide="message-square-text"></i>开始检索</button>
+                <button id="goAgentButton" class="button primary"><i data-lucide="plug-zap"></i>用于 Agent</button>
                 <button id="cleanupButton" class="button subtle"><i data-lucide="trash-2"></i>验收并清理临时文件</button>
               </div>
             </div>
@@ -151,47 +151,62 @@
         </div>
       </section>
 
-      <section id="knowledgeChatView" class="view chat-view">
-        <header class="chat-topbar">
-          <div class="chat-space">
+      <section id="agentKnowledgeView" class="view agent-view">
+        <header class="agent-topbar">
+          <div class="agent-space">
             <span class="space-icon"><i data-lucide="library"></i></span>
-            <div><small>正在检索</small><strong id="chatSpaceName">尚未选择知识空间</strong></div>
+            <div><small>当前管理空间</small><strong id="agentCurrentSpaceName">尚未选择知识空间</strong></div>
           </div>
           <div class="compact-actions">
-            <button id="changeChatSpaceButton" class="icon-text-button"><i data-lucide="folder-cog"></i>切换目录</button>
-            <button id="clearChatButton" class="icon-button" title="清空对话"><i data-lucide="rotate-ccw"></i></button>
+            <button id="changeAgentSpaceButton" class="icon-text-button"><i data-lucide="folder-cog"></i>选择目录</button>
           </div>
         </header>
 
-        <div id="chatThread" class="chat-thread">
-          <div id="chatEmpty" class="chat-empty">
-            <div class="chat-orb"><i data-lucide="search"></i></div>
-            <h1>从视频知识中找到准确答案</h1>
-            <p>输入问题，我会先检索当前目录，再用已校对的知识回答。每个答案都能回到对应视频时间点核对。</p>
-            <div class="example-prompts">
-              <button data-prompt="这个知识空间主要讲了哪些内容？">这个知识空间主要讲了哪些内容？</button>
-              <button data-prompt="帮我找到最关键的三个知识点">帮我找到最关键的三个知识点</button>
-              <button data-prompt="有哪些容易理解错误的概念？">有哪些容易理解错误的概念？</button>
+        <div class="agent-scroll">
+          <section class="agent-hero">
+            <div class="agent-orb"><i data-lucide="network"></i></div>
+            <div>
+              <div class="eyebrow">新版工作方式</div>
+              <h1>GUI 管理知识，Agent 负责回答</h1>
+              <p>在这里选择和授权知识空间。Codex、DeepSeek Harness 或其他支持 MCP 的 Agent 会按需检索可信转录、展开上下文，并打开对应视频时间点。</p>
             </div>
-          </div>
-          <div id="messageList" class="message-list"></div>
-        </div>
+          </section>
 
-        <div class="composer-wrap">
-          <div class="composer">
-            <textarea id="knowledgeComposer" rows="1" placeholder="询问当前知识空间…"></textarea>
-            <button id="sendKnowledgeButton" class="send-button" title="发送"><i data-lucide="arrow-up"></i></button>
-          </div>
-          <div class="composer-hint"><span id="knowledgeCountHint">0 个知识点</span><span>答案仅依据当前目录中的可信内容</span></div>
-        </div>
+          <div class="agent-grid">
+            <section class="agent-card">
+              <div class="agent-card-head">
+                <div><span class="eyebrow">授权范围</span><h2>可供 Agent 使用的空间</h2></div>
+                <span id="agentSpaceCount" class="count-badge">0</span>
+              </div>
+              <p class="card-description">只有你在 GUI 中打开过且仍保留授权的目录会出现在这里。Agent 看不到任意磁盘路径。</p>
+              <div id="agentSpaceList" class="agent-space-list"></div>
+            </section>
 
-        <div id="evidencePlayer" class="evidence-player hidden">
-          <div class="player-head">
-            <div><span>视频证据</span><strong id="playerTitle">—</strong></div>
-            <button id="closePlayerButton" class="icon-button"><i data-lucide="x"></i></button>
+            <section class="agent-card connection-card">
+              <div class="agent-card-head">
+                <div><span class="eyebrow">本地连接</span><h2>MCP 服务</h2></div>
+                <span id="mcpReadyBadge" class="connection-badge">检查中</span>
+              </div>
+              <p class="card-description">将下面配置添加到支持 MCP 的 Agent。服务通过 stdio 启动，不开放网络端口。</p>
+              <label class="code-label">配置片段</label>
+              <pre id="mcpConfig" class="code-block"></pre>
+              <div class="connection-actions">
+                <button id="copyMcpConfigButton" class="button primary"><i data-lucide="copy"></i>复制配置</button>
+                <button id="copyMcpCommandButton" class="button"><i data-lucide="terminal"></i>复制启动命令</button>
+              </div>
+              <div class="command-preview"><span>启动命令</span><code id="mcpCommand"></code></div>
+            </section>
           </div>
-          <video id="videoPlayer" controls preload="metadata"></video>
-          <div id="playerMeta" class="player-meta"></div>
+
+          <section class="agent-card capability-card">
+            <div class="agent-card-head"><div><span class="eyebrow">能力边界</span><h2>Agent 可以调用什么</h2></div></div>
+            <div class="capability-list">
+              <div><i data-lucide="list-tree"></i><strong>浏览空间</strong><span>查看领域、视频来源和概念目录</span></div>
+              <div><i data-lucide="search"></i><strong>组合检索</strong><span>按问题、领域或视频来源重复检索</span></div>
+              <div><i data-lucide="quote"></i><strong>读取证据</strong><span>获取可信原文并展开前后文</span></div>
+              <div><i data-lucide="play-circle"></i><strong>回到视频</strong><span>从证据对应的时间点打开本地视频</span></div>
+            </div>
+          </section>
         </div>
       </section>
     </main>
@@ -206,7 +221,7 @@
       <div class="settings-content">
         <section class="settings-section">
           <div class="settings-section-title"><span>AI 服务</span><em id="aiVerifiedBadge">未验证</em></div>
-          <p>用于判断专业词汇、可信校对和基于证据生成回答。支持 OpenAI 兼容接口。</p>
+          <p>用于判断专业词汇、可信校对和生成知识。问答上下文由你接入的 Agent 管理。</p>
           <label>Base URL<input id="aiBaseUrl" type="url" placeholder="https://api.openai.com/v1"></label>
           <div class="form-grid two">
             <label>模型<input id="aiModel" type="text" placeholder="gpt-5-mini"></label>

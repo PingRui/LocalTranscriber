@@ -23,31 +23,32 @@ class DesktopWorkflowTests(unittest.TestCase):
         stack = ExitStack()
         stack.enter_context(patch.object(GUI, "APP_SETTINGS_FILE", root / "state" / "knowledge-app.json"))
         stack.enter_context(patch.object(GUI, "MODEL_PROVIDER_SETTINGS_FILE", root / "state" / "model-providers.json"))
+        stack.enter_context(patch.object(GUI, "KNOWLEDGE_REGISTRY_FILE", root / "state" / "knowledge-spaces.json"))
         stack.enter_context(patch.object(GUI, "LOG_FILE", root / "state" / "last-run.log"))
         return stack
 
-    def test_ui_is_the_two_function_product_and_search_is_a_chat(self):
+    def test_ui_separates_knowledge_management_from_agent_answers(self):
         html = (ROOT / "ui" / "index.html").read_text(encoding="utf-8")
         script = (ROOT / "ui" / "app.js").read_text(encoding="utf-8")
         styles = (ROOT / "ui" / "styles.css").read_text(encoding="utf-8")
 
         self.assertIn('id="knowledgeGenerationView"', html)
-        self.assertIn('id="knowledgeChatView"', html)
+        self.assertIn('id="agentKnowledgeView"', html)
         self.assertIn('id="chooseVideoFolderButton"', html)
         self.assertIn('id="appendVideosButton"', html)
         self.assertIn('id="appendFolderButton"', html)
         self.assertIn('id="taskStages"', html)
-        self.assertIn('id="knowledgeComposer"', html)
-        self.assertIn('id="evidencePlayer"', html)
+        self.assertIn('id="agentSpaceList"', html)
+        self.assertIn('id="mcpConfig"', html)
+        self.assertIn('id="mcpCommand"', html)
         self.assertIn('id="aiBaseUrl"', html)
         self.assertIn('id="testAiButton"', html)
-        self.assertIn('data-lucide="message-square-text"', html)
+        self.assertIn('data-lucide="plug-zap"', html)
         self.assertIn('<script src="vendor/lucide.min.js"></script>', html)
         self.assertIn('<option value="medium">Medium</option>', html)
         self.assertIn('<option value="large-v3-turbo">Large-v3 Turbo</option>', html)
-        self.assertIn('callApi("ask_knowledge"', script)
-        self.assertIn('callApi("get_video_source"', script)
-        self.assertIn('callApi("relink_missing_video"', script)
+        self.assertIn('callApi("unregister_agent_space"', script)
+        self.assertIn('copyMcpConfigButton', script)
         self.assertIn('callApi("remove_recent_space"', script)
         self.assertIn('$("appendVideosButton").classList.toggle("hidden", !paused)', script)
         self.assertIn("waitForDesktopApi", script)
@@ -57,6 +58,8 @@ class DesktopWorkflowTests(unittest.TestCase):
         self.assertNotIn('id="openObsidianButton"', html)
         self.assertNotIn('id="chatOpenObsidianButton"', html)
         self.assertNotIn('callApi("open_obsidian"', script)
+        self.assertNotIn('callApi("ask_knowledge"', script)
+        self.assertNotIn('id="knowledgeComposer"', html)
         self.assertNotIn("trustedSearchForm", html)
         self.assertNotIn("workspaceView", html)
 
@@ -81,32 +84,23 @@ class DesktopWorkflowTests(unittest.TestCase):
             self.assertEqual(saved["recent_spaces"], [str(second)])
             self.assertTrue(marker.is_file())
 
-    def test_chat_passes_previous_messages_without_persisting_them_to_another_space(self):
+    def test_opening_space_authorizes_it_for_agents_without_exposing_its_path(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             space = root / "knowledge"
-            with self.api_context(root), patch.object(GUI.threading, "Thread") as thread_class:
+            with self.api_context(root):
                 api = GUI.KnowledgeApi()
-                api.open_space(str(space))
-                api.api_base_url = "https://example.test/v1"
-                api.api_model = "model"
-                api.api_key = "key"
-                api.api_verified_at = "verified"
-                api.messages = [
-                    {"role": "user", "content": "深蹲时膝盖方向有什么要求？"},
-                    {"role": "assistant", "content": "膝盖应与脚尖方向一致。", "citations": []},
-                ]
-
-                response = api.ask_knowledge("它为什么重要？")
+                response = api.open_space(str(space))
+                snapshot = response["snapshot"]
 
                 self.assertTrue(response["ok"])
-                thread_args = thread_class.call_args.kwargs["args"]
-                self.assertEqual(thread_args[0], str(space.resolve()))
-                self.assertEqual(thread_args[1], "它为什么重要？")
-                self.assertEqual(len(thread_args[2]), 2)
-                self.assertEqual(len(api.messages), 3)
-                self.assertFalse(api.open_space(str(root / "other"))["ok"])
-                self.assertFalse(api.clear_chat()["ok"])
+                self.assertTrue(snapshot["space"]["agent_registered"])
+                self.assertEqual(snapshot["space"]["space_id"], snapshot["agent"]["spaces"][0]["space_id"])
+                self.assertNotIn("root", snapshot["agent"]["spaces"][0])
+                self.assertNotIn(str(space.resolve()), json.dumps(snapshot["agent"]["spaces"], ensure_ascii=False))
+                removed = api.unregister_agent_space(snapshot["space"]["space_id"])
+                self.assertEqual(removed["snapshot"]["agent"]["spaces"], [])
+                self.assertTrue(space.is_dir())
 
     def test_snapshot_never_exposes_api_key(self):
         with tempfile.TemporaryDirectory() as temp:

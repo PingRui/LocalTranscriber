@@ -6,7 +6,7 @@
     .replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;").replaceAll("'", "&#039;");
   const basename = (path) => String(path || "").split(/[\\/]/).filter(Boolean).pop() || path || "";
-  const state = { snapshot: null, activeView: "generation", busy: new Set(), playerCitation: null };
+  const state = { snapshot: null, activeView: "generation", busy: new Set() };
   let toastSignature = "";
   let toastTime = 0;
   let uiBound = false;
@@ -88,7 +88,7 @@
     renderQueue();
     renderTask();
     renderSettings();
-    renderChat();
+    renderAgent();
     renderBusy();
     icons();
   }
@@ -96,8 +96,7 @@
   function renderSpace() {
     const { space, recent_spaces: recent = [], ai } = state.snapshot;
     $("spaceName").textContent = space.ready ? space.name : "选择知识空间";
-    $("chatSpaceName").textContent = space.ready ? space.name : "尚未选择知识空间";
-    $("knowledgeCountHint").textContent = `${space.knowledge_count || 0} 个知识点`;
+    $("agentCurrentSpaceName").textContent = space.ready ? space.name : "尚未选择知识空间";
     $("settingsStatusDot").classList.toggle("ready", Boolean(ai.verified));
     $("recentSpaces").innerHTML = recent.length ? recent.map((path) => `
       <div class="recent-item">
@@ -136,7 +135,7 @@
     const ready = Boolean(ai.verified);
     $("readinessCard").classList.toggle("ready", ready);
     $("readinessTitle").textContent = ready ? `AI 服务已验证 · ${ai.model}` : "AI 服务尚未配置";
-    $("readinessText").textContent = ready ? "可进行专业词汇判断、可信校对和知识回答。" : "完成连接测试后才能开始。";
+    $("readinessText").textContent = ready ? "可进行专业词汇判断、可信校对和知识生成。" : "完成连接测试后才能开始。";
     $("openSettingsInline").classList.toggle("hidden", ready);
     $("startTaskButton").disabled = running || !queue.length || !ready || !space.ready;
   }
@@ -223,79 +222,49 @@
     $("tempPolicy").value = "manual";
   }
 
-  function renderChat() {
-    const { chat, space } = state.snapshot;
-    const messages = chat.messages || [];
-    $("chatEmpty").classList.toggle("hidden", Boolean(messages.length));
-    $("messageList").innerHTML = messages.map(renderMessage).join("") + (chat.running ? renderLoadingMessage() : "");
-    $("sendKnowledgeButton").disabled = chat.running || !space.ready || !(space.knowledge_count > 0);
-    document.querySelectorAll("[data-citation-index]").forEach((button) => {
-      button.addEventListener("click", () => playCitation(Number(button.dataset.messageIndex), Number(button.dataset.citationIndex)));
+  function renderAgent() {
+    const agent = state.snapshot.agent || { spaces: [], command: [], config: {}, mcp_ready: false };
+    const spaces = Array.isArray(agent.spaces) ? agent.spaces : [];
+    $("agentSpaceCount").textContent = String(spaces.length);
+    $("agentSpaceList").innerHTML = spaces.length ? spaces.map((space) => `
+      <div class="agent-space-row">
+        <span class="agent-space-icon"><i data-lucide="database"></i></span>
+        <span class="agent-space-copy">
+          <strong>${escapeHtml(space.name)}</strong>
+          <span>${Number(space.knowledge_count || 0)} 个知识点 · ${Number(space.source_count || 0)} 个视频来源</span>
+          <code>${escapeHtml(space.space_id)}</code>
+        </span>
+        <span class="availability ${space.available ? "ready" : "missing"}">${space.available ? "可用" : "目录不可用"}</span>
+        <button class="icon-button" data-unregister-space="${escapeHtml(space.space_id)}" title="取消 Agent 授权，不删除文件"><i data-lucide="x"></i></button>
+      </div>`).join("") : `<div class="agent-empty"><i data-lucide="folder-plus"></i><span>尚未授权知识空间</span><small>在“生成知识”或本页选择一个目录即可授权。</small></div>`;
+    document.querySelectorAll("[data-unregister-space]").forEach((button) => {
+      button.addEventListener("click", () => action("agent", () => callApi("unregister_agent_space", button.dataset.unregisterSpace)));
     });
-    document.querySelectorAll("[data-relink-video]").forEach((button) => {
-      button.addEventListener("click", (event) => {
-        event.stopPropagation();
-        action("relink", () => callApi("relink_missing_video", button.dataset.relinkVideo));
-      });
-    });
-    const thread = $("chatThread");
-    requestAnimationFrame(() => { thread.scrollTop = thread.scrollHeight; });
+    const ready = Boolean(agent.mcp_ready);
+    $("mcpReadyBadge").textContent = ready ? "依赖已就绪" : "需要安装 MCP 依赖";
+    $("mcpReadyBadge").classList.toggle("ready", ready);
+    const command = (agent.command || []).map(quoteCommandPart).join(" ");
+    $("mcpCommand").textContent = command;
+    $("mcpConfig").textContent = JSON.stringify(agent.config || {}, null, 2);
+    $("copyMcpConfigButton").disabled = !ready;
+    $("copyMcpCommandButton").disabled = !ready;
   }
 
-  function renderMessage(message, messageIndex) {
-    if (message.role === "user") return `<div class="message user"><div class="user-bubble">${escapeHtml(message.content)}</div></div>`;
-    const citations = (message.citations || []).map((citation, citationIndex) => `
-      <button class="citation" data-message-index="${messageIndex}" data-citation-index="${citationIndex}">
-        <span class="citation-icon"><i data-lucide="play"></i></span>
-        <span class="citation-copy"><strong>${escapeHtml(citation.title || "视频证据")}</strong><span>${escapeHtml(basename(citation.video_path))}</span></span>
-        ${citation.video_available === false
-          ? `<span class="text-button" data-relink-video="${escapeHtml(citation.video_id)}">重新关联</span>`
-          : `<span class="citation-time">${formatTime(citation.evidence_start)}</span>`}
-      </button>`).join("");
-    return `<div class="message assistant"><div class="assistant-message">
-      <span class="assistant-avatar">知</span>
-      <div class="assistant-body"><div class="assistant-answer">${escapeHtml(message.content)}</div>
-      ${citations ? `<div class="citation-list">${citations}</div>` : ""}
-      <div class="answer-meta">${message.error ? "未完成检索" : `${(message.citations || []).length} 条可核对证据`}</div></div>
-    </div></div>`;
+  function quoteCommandPart(value) {
+    const text = String(value || "");
+    return /\s/.test(text) ? `"${text.replaceAll('"', '\\"')}"` : text;
   }
 
-  function renderLoadingMessage() {
-    return `<div class="message assistant"><div class="assistant-message"><span class="assistant-avatar">知</span><div class="assistant-body"><div class="assistant-answer loading">正在检索当前目录，并整理有证据的回答…</div></div></div></div>`;
-  }
-
-  function formatTime(seconds) {
-    const value = Math.max(0, Math.round(Number(seconds || 0)));
-    const h = Math.floor(value / 3600);
-    const m = Math.floor((value % 3600) / 60);
-    const s = value % 60;
-    return h ? `${h}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}` : `${m}:${String(s).padStart(2,"0")}`;
-  }
-
-  async function playCitation(messageIndex, citationIndex) {
-    const citation = state.snapshot?.chat?.messages?.[messageIndex]?.citations?.[citationIndex];
-    if (!citation) return;
-    if (citation.video_available === false) {
-      await action("relink", () => callApi("relink_missing_video", citation.video_id));
-      return;
-    }
-    await action("video", async () => {
-      const result = await callApi("get_video_source", citation.video_path, citation.evidence_start || 0);
-      if (!result?.uri) return;
-      const video = $("videoPlayer");
-      $("playerTitle").textContent = basename(citation.video_path);
-      $("playerMeta").textContent = `${citation.title || "视频证据"} · ${formatTime(citation.evidence_start)} — ${formatTime(citation.evidence_end)}`;
-      $("evidencePlayer").classList.remove("hidden");
-      video.src = result.uri;
-      video.onloadedmetadata = () => { video.currentTime = Number(result.start || 0); video.play().catch(() => {}); };
-    });
+  async function copyText(value, successMessage) {
+    await navigator.clipboard.writeText(String(value || ""));
+    toast(successMessage, "success");
   }
 
   function renderBusy() {
     const mapping = {
-      space: ["spaceButton", "changeChatSpaceButton", "chooseSpacePromptButton"],
+      space: ["spaceButton", "changeAgentSpaceButton", "chooseSpacePromptButton"],
       videos: ["chooseVideosButton", "addVideosButton", "appendVideosButton"], folder: ["chooseVideoFolderButton", "addFolderButton", "appendFolderButton"],
-      start: ["startTaskButton"], ai: ["testAiButton"], runtime: ["saveRuntimeButton"], chat: ["sendKnowledgeButton"]
+      start: ["startTaskButton"], ai: ["testAiButton"], runtime: ["saveRuntimeButton"]
     };
     Object.entries(mapping).forEach(([key, ids]) => ids.forEach((id) => { if ($(id)) $(id).disabled = state.busy.has(key); }));
   }
@@ -303,10 +272,9 @@
   function switchView(view) {
     state.activeView = view;
     $("knowledgeGenerationView").classList.toggle("active-view", view === "generation");
-    $("knowledgeChatView").classList.toggle("active-view", view === "chat");
+    $("agentKnowledgeView").classList.toggle("active-view", view === "agent");
     $("navGenerate").classList.toggle("active", view === "generation");
-    $("navChat").classList.toggle("active", view === "chat");
-    if (view === "chat") setTimeout(() => $("knowledgeComposer").focus(), 50);
+    $("navAgent").classList.toggle("active", view === "agent");
   }
 
   function chooseSpace() {
@@ -320,28 +288,12 @@
     setTimeout(() => $("aiBaseUrl").focus(), 40);
   }
 
-  function sendQuestion(prompt = "") {
-    const input = $("knowledgeComposer");
-    const question = String(prompt || input.value || "").trim();
-    if (!question) return;
-    if (!state.snapshot?.space?.ready) { chooseSpace(); return; }
-    input.value = "";
-    resizeComposer();
-    action("chat", () => callApi("ask_knowledge", question));
-  }
-
-  function resizeComposer() {
-    const input = $("knowledgeComposer");
-    input.style.height = "auto";
-    input.style.height = `${Math.min(input.scrollHeight, 130)}px`;
-  }
-
   function bind() {
     $("navGenerate").addEventListener("click", () => switchView("generation"));
-    $("navChat").addEventListener("click", () => switchView("chat"));
-    $("goChatButton").addEventListener("click", () => switchView("chat"));
+    $("navAgent").addEventListener("click", () => switchView("agent"));
+    $("goAgentButton").addEventListener("click", () => switchView("agent"));
     $("spaceButton").addEventListener("click", chooseSpace);
-    $("changeChatSpaceButton").addEventListener("click", () => action("space", () => callApi("choose_space")));
+    $("changeAgentSpaceButton").addEventListener("click", () => action("space", () => callApi("choose_space")));
     $("chooseVideosButton").addEventListener("click", () => action("videos", () => callApi("choose_videos")));
     $("addVideosButton").addEventListener("click", () => action("videos", () => callApi("choose_videos")));
     $("appendVideosButton").addEventListener("click", () => action("videos", () => callApi("choose_videos")));
@@ -380,12 +332,8 @@
     $("toggleApiKey").addEventListener("click", () => { $("aiApiKey").type = $("aiApiKey").type === "password" ? "text" : "password"; });
     $("chooseSpacePromptButton").addEventListener("click", () => action("space", async () => { await callApi("choose_space"); $("spacePrompt").classList.add("hidden"); }));
     $("cancelSpacePromptButton").addEventListener("click", () => $("spacePrompt").classList.add("hidden"));
-    $("sendKnowledgeButton").addEventListener("click", () => sendQuestion());
-    $("knowledgeComposer").addEventListener("input", resizeComposer);
-    $("knowledgeComposer").addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendQuestion(); } });
-    document.querySelectorAll("[data-prompt]").forEach((button) => button.addEventListener("click", () => sendQuestion(button.dataset.prompt)));
-    $("clearChatButton").addEventListener("click", () => action("chat-clear", () => callApi("clear_chat")));
-    $("closePlayerButton").addEventListener("click", () => { $("videoPlayer").pause(); $("videoPlayer").removeAttribute("src"); $("evidencePlayer").classList.add("hidden"); });
+    $("copyMcpConfigButton").addEventListener("click", () => copyText($("mcpConfig").textContent, "MCP 配置已复制"));
+    $("copyMcpCommandButton").addEventListener("click", () => copyText($("mcpCommand").textContent, "启动命令已复制"));
   }
 
   window.LocalTranscriber = {

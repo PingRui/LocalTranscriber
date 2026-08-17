@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import importlib.util
 import json
 import os
 import subprocess
@@ -18,7 +19,6 @@ from knowledge_space import (
     MEDIA_EXTENSIONS,
     OBSIDIAN_FOLDER,
     WORK_FOLDER,
-    answer_question,
     clean_task_work,
     create_task,
     discover_videos,
@@ -30,6 +30,7 @@ from knowledge_space import (
     space_paths,
     write_task,
 )
+from knowledge_service import KnowledgeService, SpaceRegistry
 from knowledge_pipeline import prepare_manual_confirmation, run_resumable_task
 from llm_client import OpenAICompatibleClient, normalize_openai_base_url
 from model_provider_config import load_provider_settings, save_provider_settings
@@ -46,6 +47,7 @@ ICON_FILE = APP_DIR / "assets" / "localtranscriber-icon.ico"
 STATE_DIR = state_dir()
 APP_SETTINGS_FILE = STATE_DIR / "knowledge-app.json"
 MODEL_PROVIDER_SETTINGS_FILE = STATE_DIR / "model-providers.json"
+KNOWLEDGE_REGISTRY_FILE = STATE_DIR / "knowledge-spaces.json"
 LOG_FILE = STATE_DIR / "last_run.log"
 EVENT_PREFIX = "@@LOCAL_TRANSCRIBER_EVENT@@"
 MEDIA_DIALOG_TYPES = (
@@ -153,6 +155,7 @@ class KnowledgeApi:
         self.app_config = load_config()
         saved = read_json(APP_SETTINGS_FILE, {})
         self.space_root = ""
+        self.space_id = ""
         self._preferred_space_root = str(saved.get("space_root") or "")
         self._knowledge_count = 0
         self._index_mtime_ns: int | None = None
@@ -173,8 +176,7 @@ class KnowledgeApi:
         self.cancel_requested = False
         self.process: subprocess.Popen[str] | None = None
         self.activities: list[dict[str, str]] = []
-        self.messages: list[dict[str, Any]] = []
-        self.chat_running = False
+        self.knowledge_service = KnowledgeService(SpaceRegistry(KNOWLEDGE_REGISTRY_FILE))
         self._last_notify = 0.0
         if initial_files:
             self._add_discovered(discover_videos(initial_files))
@@ -199,12 +201,21 @@ class KnowledgeApi:
 
     def _space_summary(self) -> dict[str, Any]:
         if not self.space_root:
-            return {"ready": False, "root": "", "name": "", "knowledge_count": 0}
+            return {
+                "ready": False,
+                "root": "",
+                "name": "",
+                "space_id": "",
+                "agent_registered": False,
+                "knowledge_count": 0,
+            }
         root = Path(self.space_root)
         return {
             "ready": True,
             "root": str(root),
             "name": root.name,
+            "space_id": self.space_id,
+            "agent_registered": bool(self.space_id),
             "knowledge_count": self._knowledge_count,
             "obsidian": str(root / OBSIDIAN_FOLDER),
             "integrity": self._integrity_status,
@@ -226,11 +237,18 @@ class KnowledgeApi:
             current_mtime_ns = index_path.stat().st_mtime_ns
             if self._index_mtime_ns == current_mtime_ns:
                 return
-            knowledge_count = len(load_index(root))
+            entries = load_index(root)
+            knowledge_count = len(entries)
         except (OSError, UnicodeError, ValueError):
             return
         self._knowledge_count = knowledge_count
         self._index_mtime_ns = current_mtime_ns
+        if self.space_id:
+            try:
+                registered = self.knowledge_service.register_space(root, entries=entries)
+                self.space_id = str(registered["space_id"])
+            except (OSError, UnicodeError, ValueError):
+                pass
 
     def _check_space_integrity(self, root: Path, entries: list[dict[str, Any]]) -> None:
         try:
@@ -252,6 +270,7 @@ class KnowledgeApi:
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             task = json.loads(json.dumps(self.task, ensure_ascii=False)) if self.task else None
+            mcp_command = [str(PYTHON), str(APP_DIR / "localtranscriber_mcp.py")]
             return {
                 "space": self._space_summary(),
                 "recent_spaces": list(self.recent_spaces),
@@ -277,7 +296,19 @@ class KnowledgeApi:
                     "language": self.language,
                     "temp_policy": self.temp_policy,
                 },
-                "chat": {"running": self.chat_running, "messages": list(self.messages)},
+                "agent": {
+                    "spaces": self.knowledge_service.list_spaces(),
+                    "mcp_ready": importlib.util.find_spec("mcp") is not None,
+                    "command": mcp_command,
+                    "config": {
+                        "mcpServers": {
+                            "localtranscriber": {
+                                "command": mcp_command[0],
+                                "args": mcp_command[1:],
+                            }
+                        }
+                    },
+                },
             }
 
     def response(self, ok: bool = True, message: str | None = None, error: str | None = None, **extra: Any) -> dict[str, Any]:
@@ -336,8 +367,6 @@ class KnowledgeApi:
     def choose_space(self) -> dict[str, Any]:
         if self.running:
             return self.response(False, error="任务进行中，暂时不能切换知识空间。")
-        if self.chat_running:
-            return self.response(False, error="上一条问答仍在处理中，暂时不能切换知识空间。")
         try:
             selected = self.open_folder_dialog(self.space_root or self._preferred_space_root)
         except (OSError, TypeError, ValueError) as exc:
@@ -349,24 +378,23 @@ class KnowledgeApi:
     def open_space(self, path: str) -> dict[str, Any]:
         if self.running:
             return self.response(False, error="任务进行中，暂时不能切换知识空间。")
-        if self.chat_running:
-            return self.response(False, error="上一条问答仍在处理中，暂时不能切换知识空间。")
         try:
             root = Path(path).expanduser().resolve()
             initialize_space(root)
             entries = load_index(root)
             knowledge_count = len(entries)
+            registered = self.knowledge_service.register_space(root, entries=entries)
             task = load_latest_resumable_task(root)
         except (OSError, UnicodeError, ValueError) as exc:
             return self.response(False, error=f"无法打开知识空间：{exc}")
         with self.lock:
             self.space_root = str(root)
+            self.space_id = str(registered["space_id"])
             self._preferred_space_root = str(root)
             self._remember_index_state(root, knowledge_count)
             self._integrity_status = "checking"
             self.recent_spaces = [str(root), *[item for item in self.recent_spaces if os.path.normcase(item) != os.path.normcase(str(root))]][:12]
             self.queue.clear()
-            self.messages.clear()
             self.task = task
             self.save_app_settings()
         if self.window is not None:
@@ -398,8 +426,22 @@ class KnowledgeApi:
         if not removed:
             return self.response(message="该目录已不在最近列表中")
         self.recent_spaces = remaining
+        try:
+            self.knowledge_service.registry.unregister_path(Path(target))
+        except (OSError, TypeError, ValueError):
+            pass
         self.save_app_settings()
-        return self.response(message="已从最近列表移除；磁盘文件未删除")
+        return self.response(message="已从最近列表和 Agent 授权中移除；磁盘文件未删除")
+
+    def unregister_agent_space(self, space_id: str) -> dict[str, Any]:
+        target = str(space_id or "").strip()
+        if not target:
+            return self.response(False, error="知识空间 ID 无效。")
+        if not self.knowledge_service.unregister_space(target):
+            return self.response(message="该知识空间已不在 Agent 授权列表中")
+        if target == self.space_id:
+            self.space_id = ""
+        return self.response(message="已取消 Agent 授权；知识空间及其中的文件未删除")
 
     def choose_videos(self) -> dict[str, Any]:
         if self.window is None:
@@ -794,55 +836,6 @@ class KnowledgeApi:
         self.queue.clear()
         return self.response(message="临时文件已清理；视频、索引和 Obsidian Wiki 均已保留")
 
-    def ask_knowledge(self, question: str) -> dict[str, Any]:
-        text = str(question or "").strip()
-        if not text:
-            return self.response(False, error="请输入问题。")
-        if not self.space_root:
-            return self.response(False, error="请先选择知识空间。")
-        if not self.api_ready():
-            return self.response(False, error="请先配置并测试 OpenAI 兼容接口。")
-        with self.lock:
-            if self.chat_running:
-                return self.response(False, error="上一条问题仍在处理中。")
-            conversation = [dict(item) for item in self.messages[-6:]]
-            space_root = self.space_root
-            self.messages.append({"role": "user", "content": text, "created_at": iso_now()})
-            self.chat_running = True
-        threading.Thread(target=self._answer_knowledge, args=(space_root, text, conversation), daemon=True).start()
-        return self.response()
-
-    def _answer_knowledge(self, space_root: str, question: str, conversation: list[dict[str, Any]]) -> None:
-        try:
-            result = answer_question(Path(space_root), question, self._client(), conversation=conversation)
-            message = {
-                "role": "assistant",
-                "content": result["answer"],
-                "citations": result["citations"],
-                "created_at": iso_now(),
-            }
-            with self.lock:
-                self.messages.append(message)
-        except Exception as exc:
-            with self.lock:
-                self.messages.append({"role": "assistant", "content": f"检索失败：{exc}", "citations": [], "error": True, "created_at": iso_now()})
-        finally:
-            self.chat_running = False
-            self.notify("chat_done", force=True)
-
-    def clear_chat(self) -> dict[str, Any]:
-        with self.lock:
-            if self.chat_running:
-                return self.response(False, error="上一条问答仍在处理中，暂时不能清空对话。")
-            self.messages.clear()
-        return self.response()
-
-    def get_video_source(self, path: str, start: Any = 0) -> dict[str, Any]:
-        target = Path(path).expanduser().resolve()
-        if not target.is_file():
-            return self.response(False, error="视频文件不可用，请重新关联。")
-        return self.response(uri=target.as_uri(), start=max(0.0, float(start)))
-
     def relink_missing_video(self, video_id: str) -> dict[str, Any]:
         if self.window is None or not self.space_root:
             return self.response(False, error="当前无法重新关联视频。")
@@ -877,15 +870,15 @@ def smoke_test() -> None:
     html = UI_FILE.read_text(encoding="utf-8")
     script = (APP_DIR / "ui" / "app.js").read_text(encoding="utf-8")
     required_html = (
-        "knowledgeGenerationView", "knowledgeChatView", "chooseVideoFolderButton",
-        "taskStages", "appendVideosButton", "appendFolderButton", "aiBaseUrl", "testAiButton", "knowledgeComposer", "evidencePlayer",
+        "knowledgeGenerationView", "agentKnowledgeView", "chooseVideoFolderButton",
+        "taskStages", "appendVideosButton", "appendFolderButton", "aiBaseUrl", "testAiButton", "agentSpaceList", "mcpCommand",
     )
     for value in required_html:
         if value not in html:
             raise RuntimeError(f"界面缺少：{value}")
     required_script = (
         "window.LocalTranscriber", "start_knowledge_task", "confirm_hotwords",
-        "ask_knowledge", "relink_missing_video", "cleanup_task",
+        "unregister_agent_space", "copyMcpConfigButton", "cleanup_task",
     )
     for value in required_script:
         if value not in script:
